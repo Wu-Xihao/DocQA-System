@@ -1,0 +1,5 @@
+# Optional: install when implementing the Web/API stage.
+-r requirements.txt
+
+fastapi>=0.115,<1
+uvicorn>=0.34,<1

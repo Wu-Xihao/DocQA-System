@@ -1,0 +1,30 @@
+# Normalize source text in the repository; avoid Windows/Linux newline churn.
+* text=auto
+.gitignore text eol=lf
+.gitattributes text eol=lf
+*.py text eol=lf
+# Markdown may use two trailing spaces for a hard line break.
+*.md text eol=lf whitespace=-blank-at-eol
+*.txt text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.sql text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary source/reference assets
+*.jpg -text
+*.jpeg -text
+*.png -text
+*.gif -text
+*.webp -text
+*.pdf -text
+*.docx -text
+*.pptx -text
+*.zip -text
+*.npy -text

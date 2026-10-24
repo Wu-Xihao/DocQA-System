@@ -1,0 +1,29 @@
+# DocQA core bootstrap dependencies for Python 3.12, Windows x86-64.
+# Compatibility ranges, NOT a tested lock file. Install and validate before
+# recording an environment snapshot. Transitive dependencies are resolved by pip.
+
+# Typed contracts and configuration
+pydantic>=2.10,<3
+pydantic-settings>=2.6,<3
+PyYAML>=6.0.2,<7
+python-dotenv>=1.0.1,<2
+packaging>=24,<27
+
+# Internal model service clients
+httpx>=0.28.1,<0.29
+
+# Document parsing and image handling
+pdfplumber>=0.11.7,<0.12
+pypdfium2>=4.30,<6
+python-docx>=1.2,<2
+python-pptx>=1.0.2,<2
+Pillow>=11.2,<13
+
+# Retrieval and local array storage
+numpy>=2.2,<3
+jieba==0.42.1
+
+# CLI, progress display and cross-process file locks
+typer>=0.16,<1
+rich>=14,<15
+portalocker>=3.1,<4

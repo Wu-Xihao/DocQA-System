@@ -1,0 +1,4 @@
+# Optional: install when implementing directory watching.
+-r requirements.txt
+
+watchdog>=6,<7
