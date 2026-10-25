@@ -1,0 +1,13 @@
+# Explicit synthetic mechanics demo; does not use actual learned models or network.
+mode: demo
+chunk:
+  target_utf8_bytes: 2400
+  max_utf8_bytes: 3600
+  overlap_utf8_bytes: 320
+analyzer_terms: [SD5993, FE_HEART_Start, FE_HEART_Stop, DocBase]
+route_top_n: 50
+fusion_top_n: 50
+top_k: 8
+rrf_k: 60
+route_weights: {dense: 1.0, bm25: 1.0, sparse: 1.0}
+allow_degraded: false

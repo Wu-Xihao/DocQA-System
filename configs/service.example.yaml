@@ -1,0 +1,21 @@
+# Copy to configs/local.service.yaml. Relative roots are resolved from this YAML's directory.
+allowed_source_roots: []  # Required for source registration and ingestion; keep narrow.
+types: [pdf, docx, pptx]
+settle_seconds: 3
+scan_interval_seconds: 1800
+missing_confirmations: 2
+max_files: 10000
+max_pending_jobs: 1000
+max_attempts: 3
+retry_base_seconds: 5
+max_jobs_per_tick: 100
+parse:
+  office_render: auto
+  ocr_mode: auto
+  analysis_revision: '1'
+  vision:
+    mode: disabled
+# Embed your verified DocBase configuration here for real retrieval models.
+retrieval:
+  mode: http
+  allow_degraded: false

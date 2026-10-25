@@ -1,0 +1,23 @@
+# Copy to configs/local.web.yaml and embed verified Agent + DocBase configuration.
+host: 127.0.0.1
+port: 8765
+index: ../runtime/service-user/index
+state: ../runtime/web-real
+service_state: ../runtime/service-user
+backend: builtin
+max_pending_jobs: 20
+runner_timeout_seconds: 150
+agent:
+  mode: http
+  generator:
+    endpoint: ''
+    model: ''
+    revision: ''
+    api_key_env: DOCQA_CHAT_KEY
+  verifier:
+    endpoint: ''
+    model: ''
+    revision: ''
+    api_key_env: DOCQA_VERIFIER_KEY
+  retrieval:
+    mode: http

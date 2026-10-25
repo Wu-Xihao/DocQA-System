@@ -1,0 +1,32 @@
+# Copy to configs/local.agent.yaml; actual model IDs and revisions must be verified.
+mode: http
+generator:
+  endpoint: ''
+  model: ''
+  revision: ''
+  api_key_env: DOCQA_CHAT_KEY
+  timeout: 30
+  retries: 2
+verifier:
+  endpoint: ''
+  model: ''
+  revision: ''
+  api_key_env: DOCQA_VERIFIER_KEY
+  timeout: 30
+  retries: 2
+max_rounds: 3
+max_subqueries: 2
+max_queries: 6
+max_model_calls: 12
+max_candidates: 100
+rerank_top_n: 50
+max_evidence_bytes: 24000
+max_output_bytes: 12000
+deadline_seconds: 120
+session_ttl_seconds: 3600
+max_session_queries: 6
+allow_degraded: false
+# Load the actual frozen DocBase configuration with CLI --retrieval-config.
+retrieval:
+  mode: http
+  allow_degraded: false

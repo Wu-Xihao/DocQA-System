@@ -1,0 +1,17 @@
+# Explicit synthetic/extractive demonstration, not real semantic verification.
+mode: demo
+max_rounds: 3
+max_subqueries: 2
+max_queries: 6
+max_candidates: 100
+rerank_top_n: 50
+max_evidence_bytes: 24000
+max_output_bytes: 12000
+max_model_calls: 12
+deadline_seconds: 120
+allow_degraded: false
+retrieval:
+  mode: demo
+  analyzer_terms: [SD5993, FE_HEART_Start, FE_HEART_Stop, DocBase]
+  top_k: 8
+  allow_degraded: false

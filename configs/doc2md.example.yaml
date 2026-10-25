@@ -1,0 +1,24 @@
+# Copy to configs/local.doc2md.yaml (ignored by Git) before adding local settings.
+category: default
+allowed_roots: []          # Empty = only the explicitly selected file's directory.
+max_file_mb: 100
+max_pages: 1000
+max_pixels: 20000000
+render_dpi: 144
+render_pdf: true
+office_render: auto       # auto | never | required
+allow_legacy_office: false
+office_executable: soffice
+ocr_mode: auto            # auto | disabled | required
+tesseract_executable: tesseract
+ocr_languages: chi_sim+eng
+external_timeout: 60
+analysis_revision: "1"    # Change after OCR language data / font / analysis policy updates.
+vision:
+  mode: disabled          # http requires explicit endpoint, model and revision below.
+  endpoint: ""            # Full chat/completions-compatible endpoint; not just a base URL.
+  model: ""
+  revision: ""
+  api_key_env: DOCQA_VISION_KEY
+  timeout: 60
+  retries: 2

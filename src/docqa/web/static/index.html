@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>DocQA · 本地文档问答</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script type="module" src="/static/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#question-input">跳至提问</a>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="DocQA 首页"><span class="brand-mark" aria-hidden="true">D<span>Q</span></span><span>DocQA<small>本地知识工作台</small></span></a>
+    <div class="header-meta"><span class="mode-badge">内置受控 Agent</span><span class="connection" id="connection-status" role="status"><i aria-hidden="true"></i>正在连接</span></div>
+  </header>
+  <div id="status-banner" class="status-banner" role="status" aria-live="polite" hidden></div>
+  <div class="workspace">
+    <aside class="sidebar" aria-label="知识范围与问答历史">
+      <section class="sidebar-section knowledge-summary">
+        <div class="eyebrow">KNOWLEDGE BASE</div><h2>我的知识库</h2>
+        <p class="subtle" id="knowledge-summary">正在读取知识库…</p>
+        <div class="generation-label">当前版本 <code id="generation-id">—</code></div>
+      </section>
+      <section class="sidebar-section">
+        <div class="section-heading"><h3>检索范围</h3><button type="button" class="text-button" id="reset-filters">重置</button></div>
+        <label for="category-select">文档分类</label>
+        <select id="category-select" aria-describedby="scope-help"><option value="">全部分类</option></select>
+        <label for="document-select">指定文档</label>
+        <select id="document-select"><option value="">范围内全部文档</option></select>
+        <p class="field-help" id="scope-help">范围是硬约束，补查不会自动扩大。每次提问固定知识库版本。</p>
+      </section>
+      <section class="sidebar-section history-section">
+        <div class="section-heading"><h3>问答记录</h3><button type="button" class="icon-button" id="refresh-history" aria-label="刷新问答记录" title="刷新记录">↻</button></div>
+        <ul id="history-list" class="history-list"><li class="subtle">暂无记录</li></ul>
+      </section>
+      <footer class="sidebar-footer"><span class="service-dot" aria-hidden="true"></span><span id="service-status">后台状态读取中</span><small>文档管理通过受控后台命令完成</small></footer>
+    </aside>
+    <main class="main-content" id="main-content">
+      <div class="intro-row"><div><div class="eyebrow">ASK YOUR DOCUMENTS</div><h1>让文档里的知识，成为答案</h1><p>检索本地资料，核对来源，再给出有据可查的回答。</p></div><span class="local-note">本地知识 · 来源可查</span></div>
+      <section class="composer-card" aria-labelledby="composer-title">
+        <form id="question-form">
+          <label class="sr-only" id="composer-title" for="question-input">输入文档问题</label>
+          <textarea id="question-input" name="question" placeholder="例如：SD5993 的 FE_HEART_Start 如何启动心跳？" maxlength="4000" rows="3" required aria-describedby="question-help"></textarea>
+          <div class="composer-tools"><label class="format-control" for="format-select">回答形式<select id="format-select" name="output_format"><option value="markdown">文字回答</option><option value="table">结构化表格</option><option value="mermaid">关系图</option></select></label><button class="primary-button" type="submit" id="ask-button" disabled><span>检索并回答</span><span aria-hidden="true">↗</span></button></div>
+          <details class="advanced-options"><summary>问题要点（可选）</summary><label for="topics-input">每行填写一个必须回答的要点，最多 12 个</label><textarea id="topics-input" rows="2" maxlength="12000" placeholder="启动条件&#10;异常恢复" aria-describedby="topics-help"></textarea><p id="topics-help" class="field-help">适合多步骤、对比问题；缺少证据的要点会明确列出。</p></details>
+          <p id="question-help" class="field-help composer-help">Ctrl / ⌘ + Enter 提交 · 回答通过检查后完整展示</p>
+        </form>
+      </section>
+      <section id="job-progress" class="progress-card" aria-labelledby="job-stage" aria-live="polite" hidden><div class="progress-icon" aria-hidden="true"></div><div class="progress-content"><strong id="job-stage">等待处理</strong><span id="job-detail">后台任务正在准备</span></div><button type="button" class="secondary-button" id="cancel-button">取消任务</button></section>
+      <section id="empty-state" class="empty-state"><div class="empty-symbol" aria-hidden="true">⌕</div><h2>从一个具体问题开始</h2><p>型号、命令、步骤或参数描述越清晰，检索越容易找到相关来源。</p><div class="principles"><span><b>01</b> 三路混合检索</span><span><b>02</b> 证据支持检查</span><span><b>03</b> 原文定位回溯</span></div></section>
+      <article id="answer-panel" class="answer-card" aria-labelledby="answer-title" hidden>
+        <header class="answer-header"><div><div class="eyebrow">DOCUMENT ANSWER</div><h2 id="answer-title">文档回答</h2></div><span id="answer-status" class="badge" data-testid="answer-status"></span></header>
+        <p id="answer-question" class="answer-question"></p>
+        <div id="verification-strip" class="verification-strip"></div>
+        <div id="answer-facts" class="answer-facts"></div>
+        <section id="graph-section" class="graph-section" aria-labelledby="graph-title" hidden><div class="section-heading"><h3 id="graph-title">来源支持的关系图</h3><div class="graph-tools"><button type="button" class="icon-button" id="graph-zoom-out" aria-label="缩小关系图">−</button><button type="button" class="text-button" id="graph-reset" aria-label="重置关系图缩放">100%</button><button type="button" class="icon-button" id="graph-zoom-in" aria-label="放大关系图">+</button><button type="button" class="text-button" id="graph-download">下载 SVG</button></div></div><p class="field-help">依据通过检查的结构化关系整理；箭头仅表示来源支持的方向。</p><div id="graph-canvas" class="graph-canvas" tabindex="0" role="region" aria-label="关系图，可用上方按钮缩放"></div><ul id="graph-relations" class="graph-relations"></ul></section>
+        <section id="claims-section"><h3 class="sr-only">已支持的回答内容</h3><div id="claims-list" data-testid="claims-list"></div></section>
+        <section id="conflicts-section" class="notice-block conflict-notice" hidden><h3>来源存在冲突</h3><ul id="conflicts-list"></ul></section>
+        <section id="coverage-section" class="coverage-section" hidden><h3>问题覆盖情况</h3><ul id="coverage-list"></ul></section>
+        <section id="unanswered-section" class="notice-block" hidden><h3>仍缺少证据的要点</h3><ul id="unanswered-list"></ul></section>
+        <section id="warnings-section" class="notice-block" hidden><h3>处理说明</h3><ul id="warnings-list"></ul></section>
+        <section id="citations-section" class="citations-section"><div class="section-heading"><h3>引用来源</h3><span id="citations-count" class="subtle"></span></div><div id="citations-list" class="citations-list" data-testid="citations-list"></div></section>
+        <footer class="answer-footer"><span id="answer-version"></span><button type="button" class="text-button" id="copy-answer">复制回答</button></footer>
+      </article>
+      <footer class="main-footer">回答以当前知识库证据为限。图片释义、OCR 转录和原生文字会分别标注。</footer>
+    </main>
+    <aside id="source-drawer" class="source-drawer" aria-label="引用原文详情" hidden><header class="drawer-header"><div><div class="eyebrow">SOURCE EVIDENCE</div><h2 id="source-title">引用原文</h2></div><button type="button" class="icon-button" id="close-source" aria-label="关闭引用原文">×</button></header><div id="source-content" class="source-content"><div id="source-meta" class="source-meta"></div><h3>引用片段</h3><blockquote id="source-quote" class="source-quote"></blockquote><div id="source-locators" class="source-locators"></div><div id="source-links" class="source-links"></div><div id="source-images" class="source-images"></div><p class="field-help">请结合完整原文核对上下文；Word 原生对象定位不代表固定页码。</p></div></aside>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
