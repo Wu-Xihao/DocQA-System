@@ -5,13 +5,16 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+import sqlite3
 import sys
 from pathlib import Path
 
+import portalocker
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from docqa.agent.config import AgentOptions
 from docqa.agent.pipeline import answer_question
+from docqa.docbase.storage import _io_path
 from docqa.domain.errors import DocQAError
 from docqa.web.runner import MAX_INPUT_BYTES, WorkerRequest, _strict_json, verify_saved_result
 
@@ -23,6 +26,30 @@ class WorkerEnvelope(BaseModel):
     agent_state: str
     options: AgentOptions
     request: WorkerRequest
+
+
+@contextlib.contextmanager
+def managed_writer(envelope):
+    directory = Path(envelope.agent_state)
+    if directory.name != envelope.job_id or directory.parent.name != "agent":
+        yield
+        return
+    database = _io_path(directory.parent.parent / "questions.sqlite")
+
+    def allowed():
+        if database.is_file():
+            with sqlite3.connect(database, timeout=10) as db:
+                row = db.execute(
+                    "SELECT state,cancel_requested FROM jobs WHERE job_id=?", (envelope.job_id,)
+                ).fetchone()
+            if row is None or row[0] != "running" or row[1]:
+                raise DocQAError("WEB_JOB_CANCELLED", "Managed question was cancelled or deleted")
+
+    allowed()
+    _io_path(directory.parent).mkdir(parents=True, exist_ok=True)
+    with portalocker.Lock(_io_path(directory.with_suffix(".writer.lock")), timeout=0):
+        allowed()
+        yield
 
 
 def main() -> int:
@@ -43,9 +70,24 @@ def main() -> int:
         except (ValidationError, ValueError, TypeError, UnicodeError) as exc:
             raise DocQAError("INVALID_REQUEST", "Invalid headless Agent input") from exc
         request = envelope.request
+
+        def preview(items):
+            rows, seen = [], set()
+            for item in items:
+                if item.is_heading or item.chunk_id in seen:
+                    continue
+                seen.add(item.chunk_id)
+                rows.append({"source_name": item.source_name[:256], "text": item.text[:360]})
+                if len(rows) == 4:
+                    break
+            directory = Path(envelope.agent_state)
+            temporary = directory / "retrieval-preview.tmp"
+            temporary.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(directory / "retrieval-preview.json")
+
         # Native dependencies sometimes print diagnostics; stdout is reserved
         # for the one-line result receipt, and all stderr stays private.
-        with contextlib.redirect_stdout(sys.stderr):
+        with managed_writer(envelope), contextlib.redirect_stdout(sys.stderr):
             print("DOCQA_STAGE:running", file=sys.stderr, flush=True)
             answer = answer_question(
                 envelope.index,
@@ -59,6 +101,9 @@ def main() -> int:
                 required_topics=request.topics,
                 output_format=request.output_format,
                 use_planner=request.use_planner,
+                context_questions=request.context_questions,
+                progress=lambda stage: print(f"DOCQA_STAGE:{stage}", file=sys.stderr, flush=True),
+                evidence_preview=preview,
             )
             result = {
                 "answer_id": answer.answer_id,

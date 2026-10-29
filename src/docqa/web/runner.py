@@ -28,7 +28,20 @@ from docqa.domain.errors import DocQAError
 MAX_INPUT_BYTES = 1_048_576
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{1,79}\Z")
-STAGES = frozenset({"running", "complete"})
+STAGES = frozenset(
+    {
+        "running",
+        "planning",
+        "retrieving",
+        "assessing",
+        "composing",
+        "validating",
+        "verifying",
+        "publishing",
+        "checking_result",
+        "complete",
+    }
+)
 _STAGE_PREFIX = b"DOCQA_STAGE:"
 _STATUS = frozenset(
     {"answered", "partial", "insufficient_evidence", "conflicting_evidence", "failed", "cancelled"}
@@ -42,10 +55,20 @@ class WorkerRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     generation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     categories: list[str] | None = Field(default=None, max_length=256)
-    doc_ids: list[str] | None = Field(default=None, max_length=256)
+    doc_ids: list[str] | None = Field(default=None, max_length=10000)
     topics: list[str] | None = Field(default=None, min_length=1, max_length=12)
     output_format: Literal["markdown", "table", "mermaid"] = "markdown"
     use_planner: bool = False
+    context_questions: list[str] = Field(default_factory=list, max_length=4)
+
+    @field_validator("context_questions")
+    @classmethod
+    def valid_context(cls, values):
+        if any(not value.strip() or len(value) > 1800 or "\x00" in value for value in values):
+            raise ValueError("Invalid conversation context")
+        if sum(len(value.encode("utf-8")) for value in values) > 16000:
+            raise ValueError("Conversation context exceeds budget")
+        return values
 
     @field_validator("question")
     @classmethod
@@ -150,8 +173,7 @@ def verify_saved_result(
         )
     ):
         raise DocQAError("RUNNER_RESULT_MISMATCH", "Saved answer differs from the pinned job scope")
-    for citation in answer.citations:
-        store.resolve_citation(answer.answer_id, citation.citation_id)
+    store.resolve_citations(answer.answer_id)
     return result
 
 
@@ -245,13 +267,13 @@ class HeadlessRunner:
             "LD_LIBRARY_PATH",
         }
         for service in services:
-            name = service.api_key_env
-            if name is None:
-                continue
-            if name.upper() in reserved or name.upper().startswith(("PYTHON", "DYLD_")):
-                raise DocQAError("INVALID_CONFIG", "Credential variable names a runtime setting")
-            if name in os.environ:
-                environment[name] = os.environ[name]
+            for name in (service.api_key_env, getattr(service, "endpoint_env", None)):
+                if name is None:
+                    continue
+                if name.upper() in reserved or name.upper().startswith(("PYTHON", "DYLD_")):
+                    raise DocQAError("INVALID_CONFIG", "Model variable names a runtime setting")
+                if name in os.environ:
+                    environment[name] = os.environ[name]
         return environment
 
     @staticmethod
@@ -317,7 +339,9 @@ class HeadlessRunner:
         except (OSError, ValueError) as exc:
             raise DocQAError("RUNNER_START_FAILED", "Cannot start the headless Agent") from exc
         capture = _Capture(self.max_output_bytes)
-        deadline = time.monotonic() + self.timeout_seconds
+        started = time.monotonic()
+        deadline = started + self.timeout_seconds
+        stages, failure, answer_status = [], None, None
 
         def write_input():
             try:
@@ -365,6 +389,13 @@ class HeadlessRunner:
                         break
                     if stage != last_stage:
                         progress(stage)
+                        if len(stages) < 128:
+                            stages.append(
+                                {
+                                    "stage": stage,
+                                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                                }
+                            )
                         last_stage = stage
 
             while True:
@@ -380,9 +411,25 @@ class HeadlessRunner:
                 raise DocQAError("RUNNER_IO_FAILED", "Cannot read headless Agent result")
             deliver_stages()
             result = _result(bytes(capture.stdout), process.returncode)
+            answer_status = result["status"]
+            progress("checking_result")
+            if len(stages) < 128:
+                stages.append(
+                    {
+                        "stage": "checking_result",
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                    }
+                )
             result = verify_saved_result(self.index, self.agent_state, job_id, selected, result)
             check_bounds()
+            progress("complete")
             return result
+        except Exception as exc:
+            code = exc.code if isinstance(exc, DocQAError) else "RUNNER_FAILED"
+            failure = (
+                code if isinstance(code, str) and _ERROR_CODE.fullmatch(code) else "RUNNER_FAILED"
+            )
+            raise
         finally:
             self._reap(process)
             for thread in threads:
@@ -390,3 +437,21 @@ class HeadlessRunner:
                     thread.join(timeout=1)
             for pipe in (process.stdin, process.stdout, process.stderr):
                 pipe.close()
+            # Only bounded phase names, timings and stable codes. Never stderr,
+            # question text, evidence, endpoint URLs or environment variables.
+            try:
+                (directory / "timing.json").write_text(
+                    json.dumps(
+                        {
+                            "job_id": job_id,
+                            "elapsed_seconds": round(time.monotonic() - started, 3),
+                            "timeout_seconds": self.timeout_seconds,
+                            "error_code": failure,
+                            "answer_status": answer_status,
+                            "stages": stages,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass  # Optional diagnostics cannot recreate deleted job directories.

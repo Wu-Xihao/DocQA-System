@@ -354,7 +354,7 @@ def test_pptx_pure_shape_flowchart_requires_visual_baseline(tmp_path):
     assert result.metadata["needs_office_render"]
 
 
-def test_pptx_chart_and_speaker_notes_have_explicit_coverage_warning(tmp_path):
+def test_pptx_chart_warns_and_speaker_notes_are_extracted_with_their_own_locator(tmp_path):
     source = tmp_path / "chart.pptx"
     presentation = Presentation()
     slide = presentation.slides.add_slide(presentation.slide_layouts[6])
@@ -370,8 +370,13 @@ def test_pptx_chart_and_speaker_notes_have_explicit_coverage_warning(tmp_path):
     result = parse_pptx(context(source))
 
     assert "VISUAL_RENDER_REQUIRED" in codes(result)
-    assert "SPEAKER_NOTES_NOT_PARSED" in codes(result)
-    assert "speaker only fact" not in " ".join(block.text for block in result.blocks)
+    assert "SPEAKER_NOTES_NOT_PARSED" not in codes(result)
+    note = next(block for block in result.blocks if block.type == "note")
+    assert note.text == "speaker only fact" and note.origin == "native"
+    assert note.locators[0].slide == 1
+    assert note.locators[0].native_ref["object"] == "speaker_notes"
+    assert note.locators[0].native_ref["part"].startswith("/ppt/notesSlides/")
+    assert note.metadata["not_visible_on_slide"]
 
 
 def test_pptx_enforces_slide_limit(tmp_path):

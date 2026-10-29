@@ -1,0 +1,19 @@
+# Isolated synthetic workspace only: no real model calls or semantic verification.
+allowed_source_roots:
+- ../runtime/workspace-demo-sources
+- ../runtime/workspace-demo-uploads
+settle_seconds: 0
+parse:
+  office_render: never
+  ocr_mode: disabled
+retrieval:
+  mode: demo
+  recall_routes:
+  - dense
+  - bm25
+  incomplete_policy: native_only
+  allow_degraded: false
+  route_weights:
+    dense: 1.0
+    bm25: 1.0
+  vector_backend: sqlite_vec

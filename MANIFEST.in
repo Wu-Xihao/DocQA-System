@@ -1,0 +1,8 @@
+include README.md requirements.txt
+recursive-include src/docqa/web/static *.html *.js *.css
+prune runtime
+prune data
+prune .design-work
+prune .local-archive
+exclude configs/.env
+global-exclude *.py[cod] __pycache__

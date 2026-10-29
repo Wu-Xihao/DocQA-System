@@ -1,23 +1,103 @@
-# Copy to configs/local.web.yaml and embed verified Agent + DocBase configuration.
+# Copy to local.web.yaml. Keep agent.retrieval identical to Service and local.database.yaml.
 host: 127.0.0.1
 port: 8765
 index: ../runtime/service-user/index
 state: ../runtime/web-real
 service_state: ../runtime/service-user
+service_config: local.service.yaml
+upload_root: ../data/private/web-uploads
+service_mode: auto
+max_upload_bytes: 104857600
+max_source_download_bytes: 268435456
 backend: builtin
 max_pending_jobs: 20
-runner_timeout_seconds: 150
+runner_timeout_seconds: 120
 agent:
   mode: http
+  combine_assessment_and_compose: true
   generator:
-    endpoint: ''
-    model: ''
-    revision: ''
-    api_key_env: DOCQA_CHAT_KEY
+    endpoint: https://api.deepseek.com/chat/completions
+    model: deepseek-flash
+    revision: provider-managed-unpinned
+    api_key_env: DEEPSEEK_API_KEY
+    thinking: disabled
+    timeout: 30
+    retries: 1
+    compact_evidence: true
   verifier:
-    endpoint: ''
-    model: ''
-    revision: ''
-    api_key_env: DOCQA_VERIFIER_KEY
+    endpoint: https://api.deepseek.com/chat/completions
+    model: deepseek-flash
+    revision: provider-managed-unpinned
+    api_key_env: DEEPSEEK_API_KEY
+    thinking: disabled
+    timeout: 30
+    retries: 1
+    compact_evidence: true
+  max_rounds: 2
+  max_subqueries: 2
+  max_queries: 4
+  max_candidates: 100
+  rerank_top_n: 30
+  max_evidence_bytes: 40000
+  initial_evidence_fraction: 0.75
+  max_output_bytes: 12000
+  max_model_calls: 12
+  deadline_seconds: 90
+  finalization_reserve_seconds: 25
+  allow_degraded: false
   retrieval:
     mode: http
+    vector_backend: sqlite_vec
+    incomplete_policy: validated_parts
+    recall_routes:
+    - dense
+    - bm25
+    - sparse
+    chunk:
+      target_utf8_bytes: 2400
+      max_utf8_bytes: 3600
+      overlap_utf8_bytes: 320
+    analyzer_terms:
+    - SD5993
+    - FE_HEART_Start
+    - FE_HEART_Stop
+    - DocBase
+    bm25_k1: 1.2
+    bm25_b: 0.75
+    route_top_n: 50
+    fusion_top_n: 50
+    top_k: 8
+    rrf_k: 60
+    route_weights:
+      dense: 1.0
+      bm25: 1.0
+      sparse: 1.0
+    allow_degraded: false
+    dense: &id001
+      protocol: dashscope.text-embedding
+      endpoint: ''
+      endpoint_env: DASHSCOPE_EMBEDDING_ENDPOINT
+      model: qwen3.7-text-embedding-flash
+      revision: aliyun-managed-unpinned
+      tokenizer_revision: aliyun-managed-unreported
+      dimension: 1024
+      vocab_size: 10000000
+      document_prefix: ''
+      query_prefix: ''
+      max_input_utf8_bytes: 8192
+      batch_size: 10
+      api_key_env: DASHSCOPE_API_KEY
+      timeout: 30
+      retries: 1
+    sparse: *id001
+    reranker:
+      protocol: gitee.rerank
+      endpoint: https://ai.gitee.com/v1/rerank
+      model: Qwen3-Reranker-8B
+      revision: gitee-managed-unpinned
+      tokenizer_revision: gitee-managed-unreported
+      max_input_utf8_bytes: 8192
+      batch_size: 16
+      api_key_env: GITEE_AI_API_KEY
+      timeout: 60
+      retries: 2

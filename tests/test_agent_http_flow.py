@@ -69,7 +69,11 @@ def protocol_fixture(tmp_path_factory):
     return target, options, providers
 
 
-def test_http_generate_assess_verify_and_saved_source_chain(real_protocol, tmp_path):
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("combined", [False, True])
+def test_http_generate_assess_verify_and_saved_source_chain(
+    real_protocol, tmp_path, compact, combined
+):
     index, retrieval, providers = real_protocol
     tasks = []
     fake = DemoChatClient()
@@ -80,7 +84,22 @@ def test_http_generate_assess_verify_and_saved_source_chain(real_protocol, tmp_p
         task = json.loads(body["messages"][1]["content"])
         tasks.append(task["task"])
         data = task["data"]
-        if task["task"] == "assess":
+        if task["task"] == "assess_and_compose":
+            from docqa.agent.providers import AssessedDraft
+
+            assessment = fake.assess(data["question"], data["topics"], data["evidence"])
+            result = AssessedDraft(
+                assessment=assessment,
+                draft=fake.compose(
+                    data["question"],
+                    data["topics"],
+                    data["evidence"],
+                    assessment,
+                    data["output_format"],
+                ),
+            )
+            assert "Synthesize and reorganize" in data["instructions"]
+        elif task["task"] == "assess":
             result = fake.assess(data["question"], data["topics"], data["evidence"])
         elif task["task"] == "compose":
             result = fake.compose(
@@ -110,6 +129,7 @@ def test_http_generate_assess_verify_and_saved_source_chain(real_protocol, tmp_p
         model="http-mock-model",
         revision="1",
         retries=0,
+        compact_evidence=compact,
     )
     clients = tuple(
         HttpChatClient(service, role=role, transport=httpx.MockTransport(chat_http))
@@ -119,11 +139,13 @@ def test_http_generate_assess_verify_and_saved_source_chain(real_protocol, tmp_p
         index,
         "SD5993",
         output=tmp_path,
-        options=AgentOptions(retrieval=retrieval),
+        options=AgentOptions(retrieval=retrieval, combine_assessment_and_compose=combined),
         chat_clients=clients,
         retrieval_providers=providers,
     )
-    assert tasks == ["assess", "compose", "verify"]
+    assert tasks == (
+        ["assess_and_compose", "verify"] if combined else ["assess", "compose", "verify"]
+    )
     assert result.status == "answered" and result.verified and not result.synthetic
     assert result.verification == "semantic_checked"
     assert SessionStore(tmp_path).resolve_citation(result.answer_id, "C0001")["snapshot_path"]

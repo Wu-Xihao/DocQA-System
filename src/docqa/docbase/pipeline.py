@@ -17,9 +17,15 @@ import portalocker
 from docqa.doc2md.common import digest
 from docqa.doc2md.pipeline import verify_artifact
 from docqa.doc2md.security import is_within
+from docqa.docbase.admission import (
+    COVERAGE_WARNING,
+    index_projection,
+    source_admission,
+)
 from docqa.docbase.analyzer import Analyzer
 from docqa.docbase.chunker import chunk_artifact, chunk_profile
 from docqa.docbase.config import DocBaseOptions
+from docqa.docbase.dashscope import shared_encoder
 from docqa.docbase.lexical import build_bm25, build_sparse
 from docqa.docbase.providers import make_providers
 from docqa.docbase.storage import _io_path, load_generation, publish, read_current, write_generation
@@ -141,11 +147,19 @@ def _sparse_value(value, vocab_size: int) -> dict[int, float]:
 
 def encode_cached(client, texts: list[str], route: str, root: Path, code: str, batch_size: int):
     profile = client.fingerprint()
-    validate = (
-        (lambda value: _dense_value(value, profile["dimension"]))
-        if route == "dense"
-        else (lambda value: _sparse_value(value, profile["vocab_size"]))
-    )
+
+    def validate(value):
+        if route == "dense_sparse":
+            if not isinstance(value, dict) or set(value) != {"dense", "sparse"}:
+                raise ValueError("Invalid joint cache representation")
+            return {
+                "dense": _dense_value(value["dense"], profile["dimension"]),
+                "sparse": _sparse_value(value["sparse"], profile["vocab_size"]),
+            }
+        if route == "dense":
+            return _dense_value(value, profile["dimension"])
+        return _sparse_value(value, profile["vocab_size"])
+
     cache = root / "cache" / route
     cache.mkdir(parents=True, exist_ok=True)
     entries, pending, keys, hits = {}, {}, [], 0
@@ -197,6 +211,11 @@ def encode_cached(client, texts: list[str], route: str, root: Path, code: str, b
                 if route == "sparse"
                 else vector
             )
+            if route == "dense_sparse":
+                stored = {
+                    "dense": vector["dense"],
+                    "sparse": {str(token): weight for token, weight in vector["sparse"].items()},
+                }
             payload = {
                 "schema_version": "docqa.model-cache.v1",
                 "key": key,
@@ -215,20 +234,18 @@ def encode_cached(client, texts: list[str], route: str, root: Path, code: str, b
     return [entries[key] for key in keys], hits
 
 
-def _source_record(path: Path):
+def _source_record(path: Path, policy: str = "reject"):
     verification = verify_artifact(path)
-    if verification["status"] != "complete":
-        raise DocQAError(
-            "SOURCE_NOT_READY",
-            "DocBase only accepts complete doc2md artifacts; resolve parsing quality warnings first",
-        )
-    ir = DocumentIR.model_validate_json((path / "document.ir.json").read_bytes())
-    source_map = json.loads((path / "source_map.json").read_bytes())
+    ir = DocumentIR.model_validate_json(_io_path(path / "document.ir.json").read_bytes())
+    quality = source_admission(ir, verification["status"], policy)
+    source_map = json.loads(_io_path(path / "source_map.json").read_bytes())
     member = {
         key: getattr(ir, key)
         for key in ("doc_id", "revision_id", "artifact_id", "category", "source_name")
     }
     member["artifact_ref"] = f"sources/artifacts/{ir.artifact_id}"
+    if quality:
+        member["source_quality"] = quality
     return ir, source_map, member
 
 
@@ -244,9 +261,12 @@ def _build_result(manifest, directory, sequence, *, reused, cache_hits=None):
         documents=manifest["member_count"],
         chunks=manifest["chunk_count"],
         cache_hits=cache_hits or {},
-        warnings=["SYNTHETIC_DEMO: mechanics only; not genuine learned model retrieval"]
-        if manifest["synthetic"]
-        else [],
+        warnings=(
+            ["SYNTHETIC_DEMO: mechanics only; not genuine learned model retrieval"]
+            if manifest["synthetic"]
+            else []
+        )
+        + ([COVERAGE_WARNING] if manifest.get("partial_source_count", 0) else []),
     )
 
 
@@ -303,6 +323,9 @@ def _build_index(
     (root / "generations").mkdir(exist_ok=True)
     emit = progress or (lambda stage, current, total: None)
     dense, sparse, reranker = providers or make_providers(options)
+    sparse_enabled = "sparse" in options.recall_routes
+    if sparse_enabled and sparse is None:
+        raise DocQAError("MODEL_NOT_CONFIGURED", "Enabled sparse recall needs a real provider")
     analyzer = Analyzer(options.analyzer_terms)
     code = implementation_profile()
     profiles = {
@@ -311,11 +334,17 @@ def _build_index(
         "chunk": chunk_profile(options.chunk),
         "analyzer": analyzer.profile(),
         "dense": dense.fingerprint(),
-        "sparse": sparse.fingerprint(),
+        "sparse": sparse.fingerprint() if sparse_enabled else {"enabled": False},
         "reranker": reranker.fingerprint(),
         "bm25": {"k1": options.bm25_k1, "b": options.bm25_b},
         "implementation": code,
     }
+    if not sparse_enabled:
+        profiles["recall_routes"] = list(options.recall_routes)
+    if options.vector_backend != "numpy":
+        profiles["vector_backend"] = options.vector_backend
+    if options.incomplete_policy != "reject":
+        profiles["incomplete_policy"] = options.incomplete_policy
     with portalocker.Lock(root / ".docbase.lock", timeout=20):
         current, sequence = read_current(root)
         selected = {}
@@ -326,7 +355,7 @@ def _build_index(
         explicit_ids = set()
         for index, path in enumerate(paths):
             emit("verify_sources", index, len(paths))
-            ir, _, _ = _source_record(path)
+            ir, _, _ = _source_record(path, options.incomplete_policy)
             if ir.doc_id in explicit_ids:
                 raise DocQAError(
                     "DUPLICATE_DOCUMENT",
@@ -337,8 +366,12 @@ def _build_index(
         chunks, members, packages = [], [], {}
         for index, (doc_id, path) in enumerate(sorted(selected.items())):
             emit("chunk", index, len(selected))
-            ir, source_map, member = _source_record(path)
-            document_chunks = chunk_artifact(ir, source_map, options.chunk)
+            ir, source_map, member = _source_record(path, options.incomplete_policy)
+            document_chunks = chunk_artifact(
+                index_projection(ir, member),
+                source_map,
+                options.chunk,
+            )
             if not document_chunks:
                 raise DocQAError(
                     "NO_INDEXABLE_CONTENT",
@@ -364,14 +397,33 @@ def _build_index(
                         )
         texts = [chunk.index_text for chunk in chunks]
         emit("dense", 0, len(texts))
-        vectors, dense_hits = encode_cached(
-            dense, texts, "dense", root, code, options.dense.batch_size
-        )
+        joint = shared_encoder(dense, sparse) if sparse_enabled else None
+        if joint is not None:
+            pairs, dense_hits = encode_cached(
+                joint, texts, "dense_sparse", root, code, min(options.dense.batch_size, 10)
+            )
+            vectors = [pair["dense"] for pair in pairs]
+            sparse_vectors = [pair["sparse"] for pair in pairs]
+        else:
+            vectors, dense_hits = encode_cached(
+                dense, texts, "dense", root, code, options.dense.batch_size
+            )
         emit("dense", len(texts), len(texts))
-        sparse_vectors, sparse_hits = encode_cached(
-            sparse, texts, "sparse", root, code, options.sparse.batch_size
-        )
-        emit("sparse", len(texts), len(texts))
+        cache_hits = {"dense": dense_hits}
+        if joint is not None:
+            cache_hits["sparse"] = dense_hits
+            emit("sparse", len(texts), len(texts))
+        elif sparse_enabled:
+            sparse_vectors, sparse_hits = encode_cached(
+                sparse, texts, "sparse", root, code, options.sparse.batch_size
+            )
+            cache_hits["sparse"] = sparse_hits
+            emit("sparse", len(texts), len(texts))
+        else:
+            # Preserve the on-disk row container for legacy readers, while
+            # profiles explicitly declare that there is no sparse encoder or
+            # learned posting. This route is unavailable, not an empty recall.
+            sparse_vectors = [{} for _ in texts]
         bm25 = build_bm25(chunks, analyzer, options.bm25_k1, options.bm25_b)
         sparse_index = build_sparse(sparse_vectors)
         generation_id = uuid4().hex
@@ -393,7 +445,9 @@ def _build_index(
                 empty=not chunks,
             )
             # write_generation already fsyncs the complete package with long-path-safe I/O.
-            staging.replace(_io_path(target))
+            from docqa.docbase.storage import install_generation
+
+            install_generation(root, staging, generation_id)
         with publication_guard() if publication_guard else nullcontext():
             new_sequence = publish(root, generation_id, current, sequence, build_key)
         emit("published", 1, 1)
@@ -402,5 +456,5 @@ def _build_index(
             target,
             new_sequence,
             reused=False,
-            cache_hits={"dense": dense_hits, "sparse": sparse_hits},
+            cache_hits=cache_hits,
         )

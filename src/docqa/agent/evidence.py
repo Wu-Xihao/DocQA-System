@@ -10,6 +10,7 @@ import json
 from hashlib import sha256
 from pathlib import Path
 
+from docqa.docbase.admission import COVERAGE_WARNING, has_coverage_gaps
 from docqa.docbase.chunker import resolve_span_text
 from docqa.docbase.retrieval import generation_directory
 from docqa.docbase.storage import _io_path, _safe_path, load_generation
@@ -132,6 +133,10 @@ def build_evidence_items(index: str | Path, generation_id: str, hits) -> list[Ev
             if chunk.artifact_id not in artifacts:
                 artifacts[chunk.artifact_id] = _source(generation, chunk)
             _, ir = artifacts[chunk.artifact_id]
+            partial_source = any(
+                member["artifact_id"] == chunk.artifact_id and has_coverage_gaps(member)
+                for member in generation.members
+            )
             blocks = {block.block_id: block for block in ir.blocks}
             figures = {figure.figure_id: figure for figure in ir.figures}
             for span in chunk.source_spans:
@@ -159,8 +164,9 @@ def build_evidence_items(index: str | Path, generation_id: str, hits) -> list[Ev
                         origin=span.origin,
                         figure_ids=[span.figure_id] if span.figure_id else [],
                         uncertainties=(
-                            figure.vision.uncertainties if figure and figure.vision else []
+                            list(figure.vision.uncertainties) if figure and figure.vision else []
                         ),
+                        coverage_warnings=[COVERAGE_WARNING] if partial_source else [],
                         is_heading=blocks[span.block_id].type == "heading",
                     )
                 )
@@ -225,7 +231,50 @@ def pack_candidates(
 
 def revalidate_evidence(index: str | Path, item: EvidenceItem) -> dict:
     """Bind a delivered item to fresh source validation, not only its stored digest."""
-    reference = source_reference(index, item.generation_id, item.chunk_id, item.source_span)
+    return revalidate_evidence_batch(index, [item])[0]
+
+
+def revalidate_evidence_batch(index: str | Path, items) -> list[dict]:
+    """Check package change identity and each source span on every batch.
+
+    An unchanged generation can reuse its process-local validation. Changes
+    invalidate the whole generation; individual evidence checks always run.
+    """
+    items = list(items)
+    if not items:
+        return []
+    generation_ids = {item.generation_id for item in items}
+    if len(generation_ids) != 1:
+        raise DocQAError("EVIDENCE_SOURCE_INVALID", "Evidence batch mixes generations")
+    generation_id = next(iter(generation_ids))
+    references = []
+    with load_generation(generation_directory(index, generation_id)) as generation:
+        if generation.manifest["generation_id"] != generation_id:
+            raise DocQAError("EVIDENCE_SOURCE_INVALID", "Evidence generation differs")
+        chunks = {chunk.chunk_id: chunk for chunk in generation.chunks}
+        sources = {}
+        for item in items:
+            chunk = chunks.get(item.chunk_id)
+            if chunk is None or item.source_span not in chunk.source_spans:
+                raise DocQAError(
+                    "EVIDENCE_SOURCE_INVALID", "Evidence span does not belong to Chunk"
+                )
+            if chunk.artifact_id not in sources:
+                sources[chunk.artifact_id] = _source(generation, chunk)
+            artifact, ir = sources[chunk.artifact_id]
+            text = resolve_span_text(ir, item.source_span)
+            if sha256(text.encode("utf-8")).hexdigest() != item.source_span.source_text_sha256:
+                raise DocQAError("EVIDENCE_SOURCE_INVALID", "Evidence source span checksum differs")
+            reference = {
+                **_reference(generation, chunk, item.source_span, artifact, ir),
+                "text": text,
+            }
+            _validate_reference(item, reference)
+            references.append(reference)
+    return references
+
+
+def _validate_reference(item: EvidenceItem, reference: dict) -> None:
     for field in (
         "generation_id",
         "chunk_id",
@@ -242,4 +291,3 @@ def revalidate_evidence(index: str | Path, item: EvidenceItem) -> dict:
         or sha256(item.text.encode("utf-8")).hexdigest() != item.text_sha256
     ):
         raise DocQAError("EVIDENCE_SOURCE_INVALID", "Delivered evidence text differs")
-    return reference

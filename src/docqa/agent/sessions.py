@@ -20,7 +20,12 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from docqa.agent.evidence import json_bytes, pack_candidates, revalidate_evidence
+from docqa.agent.evidence import (
+    json_bytes,
+    pack_candidates,
+    revalidate_evidence,
+    revalidate_evidence_batch,
+)
 from docqa.docbase.retrieval import generation_directory
 from docqa.docbase.storage import _io_path, load_generation
 from docqa.domain.answers import AnswerResult, EvidenceItem, EvidenceSession, HardFilters
@@ -288,6 +293,7 @@ class SessionStore:
         round_no=None,
         degraded=False,
         warnings=None,
+        delivery_budget_bytes=None,
     ):
         with self._transaction() as connection:
             session = self._session(connection, session_id, caller, True)
@@ -330,6 +336,10 @@ class SessionStore:
                 ) or (effective.doc_ids is not None and item.doc_id not in effective.doc_ids):
                     raise DocQAError("SESSION_FILTER_VIOLATION", "Evidence escapes the query scope")
             remaining = max(0, session.max_evidence_bytes - len(json_bytes(existing)))
+            if delivery_budget_bytes is not None:
+                if type(delivery_budget_bytes) is not int or delivery_budget_bytes <= 0:
+                    raise DocQAError("INVALID_REQUEST", "Delivery budget must be positive bytes")
+                remaining = min(remaining, delivery_budget_bytes)
             common = dict(
                 session_id=session_id,
                 generation_id=session.generation_id,
@@ -589,43 +599,64 @@ class SessionStore:
         }
 
     def resolve_citation(self, answer_id, citation_id):
+        return self.resolve_citations(answer_id, [citation_id])[citation_id]
+
+    def resolve_citations(self, answer_id, citation_ids=None):
+        """Validate a saved answer and all selected citations with one source scan."""
         result = self.load_answer(answer_id)
-        citation = next(
-            (item for item in result.citations if item.citation_id == citation_id), None
+        selected = (
+            result.citations
+            if citation_ids is None
+            else [item for item in result.citations if item.citation_id in citation_ids]
         )
-        if citation is None:
+        if citation_ids is not None and {item.citation_id for item in selected} != set(
+            citation_ids
+        ):
             raise DocQAError("CITATION_NOT_FOUND", "Citation does not belong to this answer")
+        if not selected:
+            return {}
         reference = self._answer_reference(answer_id)
         items = self.items(reference["session_id"], caller=None, require_open=False)
-        evidence = next((item for item in items if item.evidence_id == citation.evidence_id), None)
-        if evidence is None:
+        by_id = {item.evidence_id: item for item in items}
+        if any(citation.evidence_id not in by_id for citation in selected):
             raise DocQAError("EVIDENCE_SOURCE_INVALID", "Answer evidence is not retained")
-        source = revalidate_evidence(reference["index_path"], evidence)
-        if citation.quote not in evidence.text or citation.source_span != evidence.source_span:
-            raise DocQAError("EVIDENCE_SOURCE_INVALID", "Citation differs from retained evidence")
-        for field in (
-            "generation_id",
-            "chunk_id",
-            "doc_id",
-            "revision_id",
-            "artifact_id",
-            "source_name",
-            "origin",
-            "figure_ids",
-        ):
-            if getattr(citation, field) != getattr(evidence, field):
+        retained = [by_id[citation.evidence_id] for citation in selected]
+        sources = revalidate_evidence_batch(reference["index_path"], retained)
+        resolved = {}
+        for citation, evidence, source in zip(selected, retained, sources, strict=True):
+            if (
+                not citation.quote.strip()
+                or citation.quote not in evidence.text
+                or citation.source_span != evidence.source_span
+            ):
                 raise DocQAError(
-                    "EVIDENCE_SOURCE_INVALID", "Citation identity differs from retained evidence"
+                    "EVIDENCE_SOURCE_INVALID", "Citation differs from retained evidence"
                 )
-        start = evidence.text.index(citation.quote)
-        return {
-            "answer_id": answer_id,
-            "citation_id": citation_id,
-            "quote": citation.quote,
-            "quote_start_codepoint": evidence.source_span.text_start_codepoint + start,
-            "quote_end_codepoint": evidence.source_span.text_start_codepoint
-            + start
-            + len(citation.quote),
-            "quote_coordinate_basis": evidence.source_span.component,
-            **source,
-        }
+            for field in (
+                "generation_id",
+                "chunk_id",
+                "doc_id",
+                "revision_id",
+                "artifact_id",
+                "source_name",
+                "origin",
+                "figure_ids",
+            ):
+                if getattr(citation, field) != getattr(evidence, field):
+                    raise DocQAError(
+                        "EVIDENCE_SOURCE_INVALID",
+                        "Citation identity differs from retained evidence",
+                    )
+            start = evidence.text.index(citation.quote)
+            resolved[citation.citation_id] = {
+                "answer_id": answer_id,
+                "citation_id": citation.citation_id,
+                "quote": citation.quote,
+                "quote_start_codepoint": evidence.source_span.text_start_codepoint + start,
+                "quote_end_codepoint": evidence.source_span.text_start_codepoint
+                + start
+                + len(citation.quote),
+                "quote_coordinate_basis": evidence.source_span.component,
+                **source,
+            }
+        return resolved

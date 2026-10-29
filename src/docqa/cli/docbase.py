@@ -84,6 +84,19 @@ def build_command(
         _fail(exc)
 
 
+@app.command("migrate-vector-store")
+def migrate_vector_store(
+    index: Annotated[Path, typer.Option("--index")],
+    backend: Annotated[str, typer.Option("--backend")] = "sqlite_vec",
+):
+    from docqa.docbase.migration import migrate_vector_backend
+
+    try:
+        _emit(migrate_vector_backend(index, backend))
+    except DocQAError as exc:
+        _fail(exc)
+
+
 @app.command("query")
 def query_command(
     question: Annotated[str, typer.Argument()],
@@ -183,7 +196,9 @@ def doctor_command(
     try:
         options = _options(config, demo)
         try:
-            fingerprints = [service.fingerprint() for service in make_providers(options)]
+            fingerprints = [
+                service.fingerprint() for service in make_providers(options) if service is not None
+            ]
             configured, error = True, None
         except DocQAError as exc:
             fingerprints, configured, error = [], False, exc.code

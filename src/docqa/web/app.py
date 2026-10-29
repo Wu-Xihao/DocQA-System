@@ -26,7 +26,10 @@ from docqa.service.scanner import canonical_path
 from docqa.web.config import WebOptions
 from docqa.web.models import QuestionRequest
 from docqa.web.security import LocalSecurity, csrf_token
+from docqa.web.static_files import WebStaticFiles
 from docqa.web.tasks import QuestionManager
+from docqa.web.workspace import Workspace
+from docqa.web.workspace_routes import install_workspace_routes
 
 STATIC = Path(__file__).parent / "static"
 
@@ -69,16 +72,36 @@ def _error(code, message, status=400, retryable=False):
 
 
 def _status(code):
-    if code in {"WEB_JOB_NOT_FOUND", "ANSWER_NOT_FOUND", "CITATION_NOT_FOUND"}:
+    if code in {
+        "WEB_JOB_NOT_FOUND",
+        "ANSWER_NOT_FOUND",
+        "CITATION_NOT_FOUND",
+        "CONVERSATION_NOT_FOUND",
+        "WORKSPACE_ITEM_NOT_FOUND",
+    }:
         return 404
     if code == "WEB_QUEUE_FULL":
         return 429
     if code in {"INVALID_REQUEST", "INVALID_PLAN", "INVALID_CONFIG", "INVALID_GENERATION"}:
         return 422
-    if code in {"PROFILE_MISMATCH", "PUBLISH_STALE"}:
+    if code in {
+        "PROFILE_MISMATCH",
+        "PUBLISH_STALE",
+        "CONVERSATION_CHANGED",
+        "CONVERSATION_BUSY",
+        "IDEMPOTENCY_CONFLICT",
+        "SCOPE_CHANGED",
+        "SCOPE_EMPTY",
+        "ARTIFACT_RELATIONS_MISSING",
+        "ARTIFACT_EVIDENCE_MISSING",
+        "EXPORT_NOT_READY",
+        "UPLOAD_ALREADY_COMMITTED",
+    }:
         return 409
-    if code == "ASSET_TOO_LARGE":
+    if code in {"ASSET_TOO_LARGE", "BODY_TOO_LARGE", "ARTIFACT_TOO_LARGE"}:
         return 413
+    if code == "FORMAT_UNSUPPORTED":
+        return 415
     return 503
 
 
@@ -88,12 +111,18 @@ def _resources(answer_id, citation_id, image_count=0):
         metadata=base,
         markdown=base + "/content?kind=markdown",
         snapshot=base + "/content?kind=snapshot",
+        original=base + "/content?kind=snapshot&inline=true",
+        preview=base + "/original-preview",
+        images_gallery=base + "/document-images",
         images=[base + f"/content?kind=image&image={index}" for index in range(image_count)],
     )
 
 
 def web_answer(result):
     value = result.model_dump(mode="json", exclude={"trace", "answer_markdown"})
+    value["performance"] = next(
+        (event for event in reversed(result.trace) if event.get("stage") == "performance"), None
+    )
     value["topic_texts"] = {
         item["topic_id"]: item["text"]
         for event in result.trace
@@ -116,13 +145,16 @@ def create_app(options: WebOptions | None = None, *, runner_factory=None):
     options.separate_paths()
     key = _secret(options.state)
     manager = QuestionManager(options, runner_factory=runner_factory)
+    workspace = Workspace(manager)
 
     @asynccontextmanager
     async def lifespan(_app):
         manager.start()
+        workspace.start()
         try:
             yield
         finally:
+            workspace.stop()
             manager.stop()
 
     app = FastAPI(
@@ -130,6 +162,7 @@ def create_app(options: WebOptions | None = None, *, runner_factory=None):
     )
     app.state.manager = manager
     app.state.options = options
+    app.state.workspace = workspace
 
     @app.exception_handler(DocQAError)
     async def application_error(_request, exc):
@@ -182,6 +215,7 @@ def create_app(options: WebOptions | None = None, *, runner_factory=None):
         )
         value["answer_id"] = job["result"]["answer_id"] if job["result"] else None
         value["answer_status"] = job["result"]["status"] if job["result"] else None
+        value["retrieval_preview"] = manager.retrieval_preview(job)
         if full:
             result = manager.answer(job)
             value["answer"] = web_answer(result) if result else None
@@ -191,13 +225,7 @@ def create_app(options: WebOptions | None = None, *, runner_factory=None):
     def home():
         return FileResponse(STATIC / "index.html", media_type="text/html")
 
-    @app.get("/static/{name}")
-    def static(name: str):
-        if name not in {"app.js", "styles.css"}:
-            raise HTTPException(404)
-        return FileResponse(
-            STATIC / name, media_type="text/javascript" if name.endswith(".js") else "text/css"
-        )
+    app.mount("/static", WebStaticFiles(directory=STATIC, follow_symlink=False), name="static")
 
     @app.get("/api/v1/health/live")
     def live():
@@ -207,7 +235,7 @@ def create_app(options: WebOptions | None = None, *, runner_factory=None):
     def bootstrap(request: Request):
         errors, catalog = [], None
         try:
-            catalog = manager.catalog()
+            catalog = manager.catalog(display_only=True)
         except DocQAError as exc:
             errors.append(exc.code)
         from docqa.agent.providers import make_chat_clients
@@ -222,20 +250,16 @@ def create_app(options: WebOptions | None = None, *, runner_factory=None):
         service = None
         if options.service_state and (options.service_state / "service.sqlite").is_file():
             try:
-                status = Service(options.service_state).status()
-                service = {
-                    key: status[key]
-                    for key in (
-                        "documents",
-                        "desired_revision",
-                        "assembled_revision",
-                        "synced_revision",
-                        "jobs",
-                    )
-                }
-                service["unsatisfied_count"] = len(status["unsatisfied_documents"])
+                maintenance = Service(options.service_state)
+                documents = maintenance.list_documents()
+                service = {"documents": len(documents), "jobs": maintenance.queue.stats()}
+                for name in ("desired_revision", "assembled_revision", "synced_revision"):
+                    service[name] = maintenance.registry.meta(name, 0)
+                service["unsatisfied_count"] = sum(
+                    not d["removed"] and d["good_version"] != d["target_version"] for d in documents
+                )
                 service["source_errors"] = [
-                    item["scan_error"] for item in status["sources"] if item["scan_error"]
+                    item["scan_error"] for item in maintenance.list_sources() if item["scan_error"]
                 ]
             except (DocQAError, OSError):
                 errors.append("SERVICE_STATUS_UNAVAILABLE")
@@ -304,7 +328,7 @@ def create_app(options: WebOptions | None = None, *, runner_factory=None):
         return source, citation
 
     @app.get("/api/v1/queries/{answer_id}/citations/{citation_id}")
-    def citation(answer_id: str, citation_id: str, request: Request):
+    def citation(answer_id: str, citation_id: str, request: Request, include_preview: bool = False):
         source, selected = citation_source(answer_id, citation_id, request)
         public = {
             key: value
@@ -334,7 +358,34 @@ def create_app(options: WebOptions | None = None, *, runner_factory=None):
         public["citation_id"] = citation_id
         public["resources"] = _resources(answer_id, citation_id, len(source["images"]))
         public["origin"] = selected.origin
+        if include_preview:
+            from docqa.web.documents import original_content
+
+            public["original_content"] = original_content(
+                source["artifact_dir"],
+                max_bytes=options.max_asset_bytes,
+                focus_block=selected.source_span.block_id,
+            )
         return public
+
+    @app.get("/api/v1/queries/{answer_id}/citations/{citation_id}/original-preview")
+    def original_preview(
+        answer_id: str,
+        citation_id: str,
+        request: Request,
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=200, ge=1, le=200),
+    ):
+        from docqa.web.documents import original_content
+
+        source, selected = citation_source(answer_id, citation_id, request)
+        return original_content(
+            source["artifact_dir"],
+            offset=offset,
+            limit=limit,
+            max_bytes=options.max_asset_bytes,
+            focus_block=selected.source_span.block_id,
+        )
 
     @app.get("/api/v1/queries/{answer_id}/citations/{citation_id}/content")
     def content(
@@ -343,6 +394,7 @@ def create_app(options: WebOptions | None = None, *, runner_factory=None):
         request: Request,
         kind: Literal["markdown", "snapshot", "image"] = "markdown",
         image: int = Query(default=0, ge=0, le=1000),
+        inline: bool = False,
     ):
         source, _ = citation_source(answer_id, citation_id, request)
         if kind == "image":
@@ -351,6 +403,12 @@ def create_app(options: WebOptions | None = None, *, runner_factory=None):
             path = Path(source["images"][image]["path"])
         else:
             path = Path(source["markdown_path"] if kind == "markdown" else source["snapshot_path"])
+        if kind == "snapshot":
+            from docqa.web.documents import original_file
+
+            return original_file(
+                path, source["source_name"], options.max_source_download_bytes, inline=inline
+            )
         if _io_path(path).stat().st_size > options.max_asset_bytes:
             raise DocQAError("ASSET_TOO_LARGE", "Citation resource exceeds Web limit")
         raw = _io_path(path).read_bytes()
@@ -379,6 +437,49 @@ def create_app(options: WebOptions | None = None, *, runner_factory=None):
             headers={"Content-Disposition": "attachment; filename=source" + path.suffix.lower()},
         )
 
-    wrapped = LocalSecurity(app, key=key, port=options.port, max_body_bytes=options.max_body_bytes)
+    @app.get("/api/v1/queries/{answer_id}/citations/{citation_id}/document-images")
+    def citation_document_images(
+        answer_id: str,
+        citation_id: str,
+        request: Request,
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=24, ge=1, le=48),
+    ):
+        from docqa.web.documents import document_images
+
+        source, _ = citation_source(answer_id, citation_id, request)
+        return document_images(
+            source["artifact_dir"],
+            _resources(answer_id, citation_id)["images_gallery"],
+            offset=offset,
+            limit=limit,
+            max_bytes=options.max_asset_bytes,
+        )
+
+    @app.get(
+        "/api/v1/queries/{answer_id}/citations/{citation_id}/document-images/{figure_id}/content"
+    )
+    def citation_document_image(
+        answer_id: str,
+        citation_id: str,
+        figure_id: str,
+        request: Request,
+        size: int = Query(default=480, ge=64, le=2000),
+    ):
+        from docqa.web.documents import document_image
+
+        source, _ = citation_source(answer_id, citation_id, request)
+        return document_image(
+            source["artifact_dir"], figure_id, size=size, max_bytes=options.max_asset_bytes
+        )
+
+    install_workspace_routes(app, workspace, project_job)
+    wrapped = LocalSecurity(
+        app,
+        key=key,
+        port=options.port,
+        max_body_bytes=options.max_body_bytes,
+        max_upload_bytes=options.max_upload_bytes,
+    )
     wrapped.state = app.state  # Test/embedding access; never serialized to a browser.
     return wrapped

@@ -46,7 +46,9 @@ def _body(block: Block, ir: DocumentIR) -> str:
             figure = figures[figure_id]
             asset = assets[figure.asset_id]
             label = " ".join((figure.caption or figure.locator.display_label).splitlines())
-            parts.append(f"![{escape_text(label)}]({quote(asset.relative_path, safe='/')})")
+            label = str(figure.metadata.get("trace_name", label))
+            image_path = str(figure.metadata.get("trace_image_path", asset.relative_path))
+            parts.append(f"![{escape_text(label)}]({quote(image_path, safe='/')})")
             parts.append(f"图位置：{escape_text(figure.locator.display_label)}")
             if not figure.analysis_required:
                 parts.append("此图仅存档；可见区域以 Office 渲染视图为准。")

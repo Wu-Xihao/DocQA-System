@@ -232,7 +232,7 @@ def test_configuration_stays_loopback_builtin_only(tmp_path, value):
 def test_cli_help_and_configuration_doctor():
     runner = CliRunner()
     assert runner.invoke(cli, ["web", "--help"]).exit_code == 0
-    result = runner.invoke(cli, ["web", "doctor", "--config", "configs/web.demo.yaml"])
+    result = runner.invoke(cli, ["web", "doctor", "--config", "configs/web.demo.example.yaml"])
     assert result.exit_code == 0 and '"connection_tested": false' in result.stdout
 
 
@@ -297,3 +297,35 @@ def test_worker_factory_error_is_recorded_without_killing_consumer(corpus, tmp_p
         job = wait_job(client, job_id)
         assert job["error_code"] == "RUNNER_FAILED" and "leak" not in str(job)
         assert client.get("/api/v1/bootstrap").json()["worker_ready"]
+
+
+@pytest.mark.parametrize("output_format", ["table", "mermaid"])
+def test_failed_formatted_answer_exposes_root_error_instead_of_result_mismatch(
+    corpus, tmp_path, output_format
+):
+    from docqa.web.runner import HeadlessRunner
+
+    options = configured(corpus, tmp_path)
+
+    def failing_worker(job):
+        # Web dependencies are configured for demo, but this child deliberately
+        # lacks real Chat configuration. No network call can take place.
+        return HeadlessRunner(
+            options.index,
+            options.state / "agent" / job["job_id"],
+            options.agent.model_copy(update={"mode": "http"}, deep=True),
+            options.state / "runs",
+            timeout_seconds=20,
+        )
+
+    with connected(create_app(options, runner_factory=failing_worker)) as client:
+        bootstrap(client)
+        accepted = client.post(
+            "/api/v1/questions", json={"question": "SD5993", "output_format": output_format}
+        )
+        job = wait_job(client, accepted.json()["job_id"])
+        assert job["state"] == "failed"
+        assert job["error_code"] == "MODEL_NOT_CONFIGURED"
+        assert job["answer"]["requested_format"] == output_format
+        assert job["answer"]["stop_reason"] == "MODEL_NOT_CONFIGURED"
+        assert "RUNNER_RESULT_MISMATCH" not in str(job)

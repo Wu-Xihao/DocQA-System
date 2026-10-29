@@ -85,6 +85,21 @@ def test_ocr_missing_language_fails_before_recognition(monkeypatch, image_path):
     assert len(calls) == 1
 
 
+def test_ocr_explicit_language_directory_applies_to_discovery_and_recognition(
+    monkeypatch, image_path
+):
+    def command(arguments, options):
+        assert arguments[arguments.index("--tessdata-dir") + 1] == "C:/OCR data/tessdata"
+        options["stdout"].write(b"chi_sim\neng\n" if "--list-langs" in arguments else b"recognized")
+
+    calls = fake_tools(monkeypatch, command)
+    adapter = TesseractOCR(tessdata_dir="C:/OCR data/tessdata")
+    assert adapter.recognize(image_path) == "recognized"
+    assert len(calls) == 2
+    assert adapter.fingerprint()["tessdata_dir"] == "C:/OCR data/tessdata"
+    assert "tessdata_dir" not in TesseractOCR().fingerprint()
+
+
 @pytest.mark.parametrize("code,expected", [(1, "OCR_LANGUAGE_CHECK_FAILED"), (0, "OCR_FAILED")])
 def test_ocr_failed_tool_status(monkeypatch, image_path, code, expected):
     def command(arguments, options):
@@ -282,6 +297,29 @@ def test_office_rejects_invalid_results(monkeypatch, tmp_path, result, expected)
     assert failure.value.code == expected
 
 
+def test_office_cleanup_handles_deep_extension_registry_paths(monkeypatch, tmp_path):
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"mock source")
+    output = tmp_path / "output"
+
+    def convert(arguments, _):
+        export = Path(arguments[arguments.index("--outdir") + 1])
+        profile = export.parent / "profile"
+        nested = profile / "user" / "extensions"
+        while len(str(nested)) < 320:
+            nested /= "registry-extension-backend"
+        # Reproduce LibreOffice creating paths ordinary Windows cleanup misses.
+        extended = Path("\\\\?\\" + str(nested)) if adapters.os.name == "nt" else nested
+        extended.mkdir(parents=True)
+        (extended / "page1.xhp").write_bytes(b"extension data")
+        (export / "source.pdf").write_bytes(b"%PDF-1.7\nmock export")
+
+    fake_tools(monkeypatch, convert)
+    result = LibreOfficeRenderer().render(source, output)
+    assert result.is_file()
+    assert list(output.iterdir()) == [result]
+
+
 def make_client(handler, **kwargs):
     return HttpVisionClient(
         endpoint="https://internal.example/v1/chat/completions",
@@ -297,6 +335,42 @@ def envelope(content):
 
 
 VALID_VISION = {"status": "ok", "observations": ["A box is visible."]}
+
+
+@pytest.mark.parametrize("thinking", [None, "enabled", "disabled"])
+def test_vision_optional_thinking_is_explicit_in_request_and_profile(image_path, thinking):
+    def handler(request):
+        body = json.loads(request.content)
+        if thinking is None:
+            assert "thinking" not in body
+        else:
+            assert body["thinking"] == {"type": thinking}
+        return httpx.Response(200, json=envelope(json.dumps(VALID_VISION)))
+
+    client = make_client(handler, thinking=thinking)
+    assert client.describe(image_path).status == "ok"
+    if thinking is None:
+        assert "thinking" not in client.fingerprint()
+    else:
+        assert client.fingerprint()["thinking"] == thinking
+
+
+def test_vision_rejects_invalid_thinking_before_network():
+    with pytest.raises(ValueError):
+        make_client(lambda _: pytest.fail("must not access network"), thinking="automatic")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_qwen_vision_uses_enable_thinking_without_deepseek_field(image_path, enabled):
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["enable_thinking"] is enabled
+        assert "thinking" not in body
+        return httpx.Response(200, json=envelope(json.dumps(VALID_VISION)))
+
+    client = make_client(handler, enable_thinking=enabled)
+    assert client.describe(image_path).status == "ok"
+    assert client.fingerprint()["enable_thinking"] is enabled
 
 
 def test_vision_request_and_result_contract(monkeypatch, image_path):

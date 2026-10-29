@@ -21,6 +21,11 @@ class WebOptions(Contract):
     index: Path = Path("runtime/docbase")
     state: Path = Path("runtime/web")
     service_state: Path | None = None
+    service_config: Path | None = None
+    upload_root: Path | None = None
+    service_mode: Literal["auto", "external", "disabled"] = "auto"
+    max_upload_bytes: int = Field(default=104857600, ge=1024, le=1073741824)
+    max_source_download_bytes: int = Field(default=268435456, ge=1024, le=1073741824)
     app_name: str = Field(default="DocQA 文档工作台", min_length=1, max_length=80)
     backend: Literal["builtin"] = "builtin"
     max_pending_jobs: int = Field(default=20, ge=1, le=1000)
@@ -31,6 +36,10 @@ class WebOptions(Contract):
 
     @model_validator(mode="after")
     def separate_paths(self):
+        if self.runner_timeout_seconds <= self.agent.deadline_seconds:
+            raise ValueError(
+                "Runner timeout must exceed the Agent deadline for startup and publication"
+            )
         state, index = self.state.absolute(), self.index.absolute()
         if is_within(state, index) or is_within(index, state):
             raise ValueError("Web state and knowledge index must be separate")
@@ -51,7 +60,7 @@ def load_options(path: Path | str | None) -> WebOptions:
                 value = {}
         if not isinstance(value, dict):
             raise ValueError("Expected a configuration object")
-        for key in ("state", "index", "service_state"):
+        for key in ("state", "index", "service_state", "service_config", "upload_root"):
             if value.get(key) is not None:
                 source = Path(value[key])
                 value[key] = canonical_path(

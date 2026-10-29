@@ -1,4 +1,4 @@
-# DocQA core bootstrap dependencies for Python 3.12, Windows x86-64.
+# DocQA complete application and development dependencies for Python 3.12, Windows x86-64.
 # Compatibility ranges, NOT a tested lock file. Install and validate before
 # recording an environment snapshot. Transitive dependencies are resolved by pip.
 
@@ -27,3 +27,20 @@ jieba==0.42.1
 typer>=0.16,<1
 rich>=14,<15
 portalocker>=3.1,<4
+sqlite-vec==0.1.6
+
+# Web application and background maintenance
+fastapi==0.162.0
+starlette==1.10.0
+uvicorn==0.54.0
+
+# Development and regression tests
+pytest>=8.3,<10
+pytest-asyncio>=1,<2
+pytest-cov>=6,<8
+respx>=0.22,<0.23
+ruff>=0.11,<1
+playwright>=1.50,<2
+
+# Optional historical local BGE encoder: pip install -e .[legacy-sparse]
+# The current DashScope three-route deployment requires no FlagEmbedding or local weights.

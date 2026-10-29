@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZipFile
@@ -15,6 +16,21 @@ LEGACY = {".doc": "doc", ".ppt": "ppt"}
 
 def is_within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
+
+
+def io_path(path: Path) -> Path:
+    """Use extended Windows paths for IO, never for persisted logical identities.
+
+    This only adapts paths; callers still perform their normal containment,
+    type and integrity checks on canonical paths before opening files.
+    """
+    path = Path(path).absolute()
+    value = str(path)
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return path
+    if value.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + value[2:])
+    return Path("\\\\?\\" + value)
 
 
 def validate_source(source: Path, options: ParseOptions) -> tuple[Path, str, bool]:

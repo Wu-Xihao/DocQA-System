@@ -18,6 +18,8 @@ class VisionConfig(Contract):
     model: str = ""
     revision: str = ""
     api_key_env: str | None = None
+    thinking: Literal["enabled", "disabled"] | None = None
+    enable_thinking: bool | None = None
     timeout: float = Field(default=60, gt=0, le=600)
     retries: int = Field(default=2, ge=0, le=3)
 
@@ -45,6 +47,7 @@ class ParseOptions(Contract):
     office_executable: str = "soffice"
     ocr_mode: Literal["auto", "disabled", "required"] = "auto"
     tesseract_executable: str = "tesseract"
+    tessdata_dir: str | None = None
     ocr_languages: str = "chi_sim+eng"
     external_timeout: float = Field(default=60, gt=0, le=600)
     analysis_revision: str = "1"

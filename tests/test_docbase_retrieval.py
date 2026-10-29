@@ -217,6 +217,21 @@ def test_rrf_uses_rank_instead_of_incompatible_scores_and_never_double_votes():
     assert raw[0]["dense"] == 1000
 
 
+def test_two_route_recall_uses_only_dense_and_bm25_and_still_reranks(dataset, tmp_path):
+    options = DocBaseOptions(mode="demo", top_k=3, recall_routes=["dense", "bm25"])
+    dense, sparse, reranker = make_providers(options)
+    assert sparse is None
+    assert options.route_weights == {"dense": 1.0, "bm25": 1.0}
+    built = build_index(dataset.artifacts, tmp_path / "two-route", options=options)
+    assert built.documents == 3
+    result = query(tmp_path / "two-route", "common heartbeat", options=options)
+    assert result.status == "ok"
+    assert result.hits
+    assert set(result.routes) == {"dense", "bm25", "reranker"}
+    assert all("sparse" not in hit.route_ranks for hit in result.hits)
+    assert all(hit.rerank_score is not None for hit in result.hits)
+
+
 class FailingEncoder:
     def __init__(self, original, *, mismatch=False):
         self.original = original

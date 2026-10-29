@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -17,7 +18,7 @@ from docqa.agent.sessions import SessionStore
 from docqa.docbase.providers import make_providers
 from docqa.docbase.storage import _io_path, load_generation, read_current
 from docqa.domain.errors import DocQAError
-from docqa.web.runner import HeadlessRunner
+from docqa.web.runner import STAGES, HeadlessRunner
 
 
 class TaskStore:
@@ -42,6 +43,7 @@ class TaskStore:
         db = sqlite3.connect(_io_path(self.path), timeout=10, isolation_level=None)
         db.row_factory = sqlite3.Row
         try:
+            db.execute("PRAGMA secure_delete=ON")
             db.execute("BEGIN IMMEDIATE")
             yield db
             db.commit()
@@ -81,6 +83,16 @@ class TaskStore:
 
     def get(self, job_id, owner_id=None):
         with self.transaction() as db:
+            hidden = (
+                owner_id
+                and db.execute("SELECT 1 FROM sqlite_master WHERE name='ws_messages'").fetchone()
+                and db.execute(
+                    "SELECT 1 FROM ws_messages m JOIN ws_conversations c ON c.id=m.conversation WHERE m.job_id=? AND c.deleted=1",
+                    (job_id,),
+                ).fetchone()
+            )
+            if hidden:
+                raise DocQAError("WEB_JOB_NOT_FOUND", "Question task was deleted")
             row = db.execute(
                 "SELECT * FROM jobs WHERE job_id=?" + (" AND owner_id=?" if owner_id else ""),
                 (job_id, owner_id) if owner_id else (job_id,),
@@ -112,7 +124,7 @@ class TaskStore:
             return self.decode(row)
 
     def stage(self, job_id, stage):
-        if stage not in {"starting", "running", "complete"}:
+        if stage not in {"starting", *STAGES}:
             return
         with self.transaction() as db:
             db.execute(
@@ -179,9 +191,12 @@ class TaskStore:
     def by_answer(self, answer_id, owner_id):
         # Do not expose a SessionStore answer merely because its random ID is known.
         with self.transaction() as db:
+            exclude_deleted = ""
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='ws_messages'").fetchone():
+                exclude_deleted = " AND NOT EXISTS(SELECT 1 FROM ws_messages m JOIN ws_conversations c ON c.id=m.conversation WHERE m.job_id=jobs.job_id AND c.deleted=1)"
             row = db.execute(
                 "SELECT * FROM jobs WHERE owner_id=? AND state IN ('succeeded','failed') "
-                "AND json_extract(result,'$.answer_id')=?",
+                "AND json_extract(result,'$.answer_id')=?" + exclude_deleted,
                 (owner_id, answer_id),
             ).fetchone()
         if row is None:
@@ -199,6 +214,8 @@ class QuestionManager:
         self.thread = None
         self.lock = None
         self.lifecycle = threading.Lock()
+        self.activity = threading.RLock()
+        self.active_jobs = set()
 
     @property
     def ready(self):
@@ -239,13 +256,20 @@ class QuestionManager:
         if self.lock:
             self.lock.release()
 
-    def catalog(self):
+    def catalog(self, *, display_only=False):
+        if display_only:
+            from docqa.web.catalog import display_catalog
+
+            return display_catalog(self.options.index, self.options.agent.retrieval)
         if not (self.options.index / "registry.sqlite").is_file():
             raise DocQAError("INDEX_NOT_FOUND", "Build or configure a knowledge index first")
         generation_id, _ = read_current(self.options.index)
         if generation_id is None:
             raise DocQAError("INDEX_NOT_FOUND", "No published knowledge index")
         with load_generation(self.options.index / "generations" / generation_id) as generation:
+            from docqa.docbase.retrieval import validate_recall_selection
+
+            validate_recall_selection(generation, self.options.agent.retrieval)
             if generation.profiles["mode"] != self.options.agent.retrieval.mode:
                 raise DocQAError(
                     "PROFILE_MISMATCH", "Knowledge index and retrieval configuration differ"
@@ -260,15 +284,29 @@ class QuestionManager:
                 categories=sorted({item["category"] for item in docs}),
                 chunks=len(generation.chunks),
                 synthetic=generation.manifest["synthetic"],
+                recall_routes=list(self.options.agent.retrieval.recall_routes),
+                partial_documents=generation.manifest.get("partial_source_count", 0),
             )
 
     def submit(self, owner_id, request):
         if not self.ready:
             raise DocQAError("WORKER_UNAVAILABLE", "Question worker is not running", retryable=True)
-        catalog = self.catalog()
+        catalog = self.catalog(display_only=True)
         make_chat_clients(self.options.agent)  # Configuration probe; no network requests.
         make_providers(self.options.agent.retrieval)
         payload = request.model_dump(mode="json")
+        types = payload.pop("doc_types", None)
+        if types is not None:
+            allowed = [
+                d["doc_id"]
+                for d in catalog["documents"]
+                if Path(d["source_name"]).suffix.lower().lstrip(".") in types
+                and (request.categories is None or d["category"] in request.categories)
+                and (request.doc_ids is None or d["doc_id"] in request.doc_ids)
+            ]
+            if not allowed:
+                raise DocQAError("SCOPE_EMPTY", "No documents match the selected types")
+            payload["doc_ids"] = allowed
         payload["generation_id"] = catalog["generation_id"]
         job = self.store.enqueue(owner_id, payload)
         self.wakeup.set()
@@ -282,10 +320,36 @@ class QuestionManager:
             return None
         return SessionStore(self.agent_state(job["job_id"])).load_answer(job["result"]["answer_id"])
 
+    def retrieval_preview(self, job):
+        if job["state"] != "running":
+            return []
+        path = _io_path(self.agent_state(job["job_id"]) / "retrieval-preview.json")
+        try:
+            if path.stat().st_size > 16384:
+                return []
+            rows = json.loads(path.read_bytes())
+            if not isinstance(rows, list) or len(rows) > 4:
+                return []
+            if any(
+                set(r) != {"source_name", "text"}
+                or not isinstance(r["source_name"], str)
+                or not isinstance(r["text"], str)
+                or len(r["source_name"]) > 256
+                or len(r["text"]) > 360
+                for r in rows
+            ):
+                return []
+            return rows
+        except (OSError, ValueError, TypeError):
+            return []
+
     def _loop(self):
         while not self.shutdown.is_set():
             try:
-                job = self.store.claim()
+                with self.activity:
+                    job = self.store.claim()
+                    if job is not None:
+                        self.active_jobs.add(job["job_id"])
                 if job is None:
                     self.wakeup.wait(0.2)
                     self.wakeup.clear()
@@ -311,12 +375,31 @@ class QuestionManager:
                         ),
                         progress=lambda stage: self.store.stage(job["job_id"], stage),
                     )
-                    self.store.finish(job["job_id"], receipt=receipt)
+                    error_code = None
+                    if receipt["status"] == "failed":
+                        failed = SessionStore(self.agent_state(job["job_id"])).load_answer(
+                            receipt["answer_id"]
+                        )
+                        error_code = failed.stop_reason
+                        logging.getLogger(__name__).warning(
+                            "DocQA Agent failed: job=%s code=%s", job["job_id"], error_code
+                        )
+                    self.store.finish(job["job_id"], receipt=receipt, error_code=error_code)
                 except Exception as exc:
+                    code = exc.code if isinstance(exc, DocQAError) else "RUNNER_FAILED"
+                    logging.getLogger(__name__).warning(
+                        "DocQA question failed: job=%s stage=%s code=%s",
+                        job["job_id"],
+                        self.store.get(job["job_id"])["stage"],
+                        code,
+                    )
                     self.store.finish(
                         job["job_id"],
-                        error_code=exc.code if isinstance(exc, DocQAError) else "RUNNER_FAILED",
+                        error_code=code,
                     )
+                finally:
+                    with self.activity:
+                        self.active_jobs.discard(job["job_id"])
             except (DocQAError, OSError, ValueError, sqlite3.Error):
                 # Persistence failure makes the consumer unavailable. Never accept
                 # more async work into a queue without a functioning consumer.

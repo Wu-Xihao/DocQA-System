@@ -1,8 +1,10 @@
 """Explicit HTTP contracts and clearly labelled deterministic demo providers.
 
-The sparse contract carries BGE-M3 lexical token weights, not ordinary words or
-BM25 scores. An actual server must adapt its protocol to this documented contract.
-No model is downloaded and failed HTTP services never fall back to the demo.
+Sparse contracts carry learned lexical token weights, not ordinary words or
+BM25 scores. DashScope supplies dense+sparse in one explicitly shared encoder.
+Dense OpenAI embeddings and Gitee rerank are selected explicitly;
+the original docbase.http.v1 contract remains the default. No model is downloaded
+and failed HTTP services never fall back to the demo.
 """
 
 from __future__ import annotations
@@ -148,10 +150,34 @@ def _validate_endpoint(value):
 
 class _HttpService:
     role: str
+    protocols = {"docbase.http.v1"}
 
-    def __init__(self, config: ServiceOptions, *, transport: httpx.BaseTransport | None = None):
+    def __init__(
+        self, config: ServiceOptions, *, transport: httpx.BaseTransport | None = None, deadline=None
+    ):
         self.config = config.model_copy(deep=True)
         self.transport = transport
+        self.deadline = deadline
+        if deadline is not None and (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (float, int))
+            or not math.isfinite(deadline)
+        ):
+            raise DocQAError(
+                "INVALID_CONFIG", "Model deadline must be a finite monotonic timestamp"
+            )
+        if config.endpoint_env:
+            endpoint = os.environ.get(config.endpoint_env, "").strip()
+            if not endpoint:
+                raise DocQAError(
+                    "MODEL_NOT_CONFIGURED", "Configured endpoint variable is unavailable"
+                )
+            self.config.endpoint = endpoint
+        config = self.config
+        if config.protocol not in self.protocols:
+            raise DocQAError(
+                "INVALID_CONFIG", "Model protocol does not support this retrieval role"
+            )
         _validate_endpoint(config.endpoint)
         if not all(
             value.strip() for value in (config.model, config.revision, config.tokenizer_revision)
@@ -163,7 +189,7 @@ class _HttpService:
     def fingerprint(self):
         config = self.config
         value = {
-            "protocol": "docbase.http.v1",
+            "protocol": config.protocol,
             "role": self.role,
             "synthetic": False,
             "endpoint_sha256": hashlib.sha256(config.endpoint.encode()).hexdigest(),
@@ -180,6 +206,14 @@ class _HttpService:
             value["normalization"] = "client_l2_then_float32"
         return value
 
+    def _payload(self, fields):
+        return {
+            "model": self.config.model,
+            "revision": self.config.revision,
+            "tokenizer_revision": self.config.tokenizer_revision,
+            **fields,
+        }
+
     def _post(self, fields):
         config = self.config
         headers = {"Accept": "application/json"}
@@ -190,26 +224,23 @@ class _HttpService:
                     "MODEL_CREDENTIAL_MISSING", "Configured model credential is unavailable"
                 )
             headers["Authorization"] = "Bearer " + secret
-        payload = {
-            "model": config.model,
-            "revision": config.revision,
-            "tokenizer_revision": config.tokenizer_revision,
-            **fields,
-        }
+        payload = self._payload(fields)
         for attempt in range(config.retries + 1):
+            remaining = self._remaining()
             try:
                 with httpx.Client(
                     transport=self.transport,
-                    timeout=config.timeout,
+                    timeout=config.timeout if remaining is None else min(config.timeout, remaining),
                     follow_redirects=False,
                     trust_env=False,
                 ) as client:
                     with client.stream(
                         "POST", config.endpoint, json=payload, headers=headers
                     ) as response:
+                        self._remaining()
                         if response.status_code in {408, 429, 500, 502, 503, 504}:
                             if attempt < config.retries:
-                                time.sleep(min(0.1 * 2**attempt, 1))
+                                self._pause(attempt)
                                 continue
                             raise DocQAError(
                                 "MODEL_SERVICE_UNAVAILABLE",
@@ -223,6 +254,7 @@ class _HttpService:
                             )
                         data = bytearray()
                         for part in response.iter_bytes(chunk_size=65536):
+                            self._remaining()
                             data.extend(part)
                             if len(data) > config.max_response_bytes:
                                 raise _invalid_response()
@@ -230,20 +262,39 @@ class _HttpService:
                             result = json.loads(bytes(data), object_pairs_hook=_unique_json_object)
                         except (ValueError, UnicodeDecodeError, RecursionError) as exc:
                             raise _invalid_response() from exc
+                        self._remaining()
                         return result
             except httpx.TimeoutException as exc:
+                self._remaining()
                 if attempt == config.retries:
                     raise DocQAError(
                         "MODEL_SERVICE_TIMEOUT", "Model service timed out", retryable=True
                     ) from exc
             except httpx.TransportError as exc:
+                self._remaining()
                 if attempt == config.retries:
                     raise DocQAError(
                         "MODEL_SERVICE_UNAVAILABLE", "Cannot reach model service", retryable=True
                     ) from exc
             if attempt < config.retries:
-                time.sleep(min(0.1 * 2**attempt, 1))
+                self._pause(attempt)
         raise AssertionError("bounded retry loop must return or raise")
+
+    def _remaining(self):
+        if self.deadline is None:
+            return None
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise DocQAError(
+                "MODEL_DEADLINE_EXCEEDED", "Model request exhausted the answer time budget"
+            )
+        return remaining
+
+    def _pause(self, attempt):
+        remaining = self._remaining()
+        delay = min(0.1 * 2**attempt, 1)
+        time.sleep(delay if remaining is None else min(delay, remaining))
+        self._remaining()
 
     def _batches(self, values):
         size = self.config.batch_size
@@ -253,11 +304,22 @@ class _HttpService:
 
 class HttpDenseClient(_HttpService):
     role = "dense"
+    protocols = {"docbase.http.v1", "openai.embeddings"}
 
-    def __init__(self, config, *, transport=None):
-        super().__init__(config, transport=transport)
+    def __init__(self, config, *, transport=None, deadline=None):
+        super().__init__(config, transport=transport, deadline=deadline)
         if config.dimension is None:
             raise DocQAError("MODEL_NOT_CONFIGURED", "Dense dimension must be configured")
+
+    def _payload(self, fields):
+        if self.config.protocol == "openai.embeddings":
+            return {
+                "model": self.config.model,
+                "input": fields["input"],
+                "encoding_format": "float",
+                "dimensions": self.config.dimension,
+            }
+        return super()._payload(fields)
 
     def encode(self, texts: list[str], input_type: InputType = "document") -> list[list[float]]:
         values = _validate_inputs(texts, input_type, self.config)
@@ -279,8 +341,8 @@ class HttpDenseClient(_HttpService):
 class HttpSparseClient(_HttpService):
     role = "sparse"
 
-    def __init__(self, config, *, transport=None):
-        super().__init__(config, transport=transport)
+    def __init__(self, config, *, transport=None, deadline=None):
+        super().__init__(config, transport=transport, deadline=deadline)
         if config.vocab_size is None:
             raise DocQAError("MODEL_NOT_CONFIGURED", "Sparse vocab_size must be configured")
 
@@ -315,6 +377,19 @@ class HttpSparseClient(_HttpService):
 
 class HttpReranker(_HttpService):
     role = "reranker"
+    protocols = {"docbase.http.v1", "gitee.rerank"}
+
+    def _payload(self, fields):
+        if self.config.protocol == "gitee.rerank":
+            return {
+                "model": self.config.model,
+                "query": fields["query"],
+                "documents": fields["documents"],
+                # Gitee defaults to three results. Every submitted candidate
+                # needs a score so source rows cannot disappear silently.
+                "top_n": len(fields["documents"]),
+            }
+        return super()._payload(fields)
 
     def rerank(self, question: str, texts: list[str]) -> list[float]:
         question_values = _validate_inputs([question], "query", self.config)
@@ -441,23 +516,37 @@ class DemoReranker(_DemoService):
 
 
 def make_providers(
-    options: DocBaseOptions, *, transport=None
-) -> tuple[DenseClient, SparseClient, Reranker]:
+    options: DocBaseOptions, *, transport=None, deadline=None
+) -> tuple[DenseClient, SparseClient | None, Reranker]:
     """Fail closed in HTTP mode; demo must be an explicit user configuration."""
     if options.mode == "demo":
         return (
             DemoDenseClient(options.dense),
-            DemoSparseClient(options.sparse),
+            DemoSparseClient(options.sparse) if "sparse" in options.recall_routes else None,
             DemoReranker(options.reranker),
         )
-    if any(
-        not config.endpoint.strip() for config in (options.dense, options.sparse, options.reranker)
-    ):
+    required = [options.dense, options.reranker]
+    if "sparse" in options.recall_routes:
+        required.append(options.sparse)
+    if any(not config.endpoint.strip() and not config.endpoint_env for config in required):
         raise DocQAError(
-            "MODEL_NOT_CONFIGURED", "Configure dense, sparse and reranker service endpoints"
+            "MODEL_NOT_CONFIGURED", "Configure enabled recall encoders and reranker endpoints"
+        )
+    if options.dense.protocol == "dashscope.text-embedding":
+        from docqa.docbase.dashscope import DashScopeEmbeddingClient, DashScopeView
+
+        if options.dense != options.sparse or "sparse" not in options.recall_routes:
+            raise DocQAError("INVALID_CONFIG", "DashScope needs a matching joint encoder pair")
+        encoder = DashScopeEmbeddingClient(options.dense, transport=transport, deadline=deadline)
+        return (
+            DashScopeView(encoder, "dense"),
+            DashScopeView(encoder, "sparse"),
+            HttpReranker(options.reranker, transport=transport, deadline=deadline),
         )
     return (
-        HttpDenseClient(options.dense, transport=transport),
-        HttpSparseClient(options.sparse, transport=transport),
-        HttpReranker(options.reranker, transport=transport),
+        HttpDenseClient(options.dense, transport=transport, deadline=deadline),
+        HttpSparseClient(options.sparse, transport=transport, deadline=deadline)
+        if "sparse" in options.recall_routes
+        else None,
+        HttpReranker(options.reranker, transport=transport, deadline=deadline),
     )

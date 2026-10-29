@@ -1,24 +1,28 @@
-# Copy to configs/local.doc2md.yaml (ignored by Git) before adding local settings.
-category: default
-allowed_roots: []          # Empty = only the explicitly selected file's directory.
+# Copy to local.doc2md.yaml. Set local OCR/Office paths; model IDs must match your platform.
+category: auto
+allowed_roots:
+- ../data/private/documents
+- ../data/private/web-uploads
 max_file_mb: 100
 max_pages: 1000
 max_pixels: 20000000
 render_dpi: 144
 render_pdf: true
-office_render: auto       # auto | never | required
+office_render: auto
 allow_legacy_office: false
 office_executable: soffice
-ocr_mode: auto            # auto | disabled | required
+ocr_mode: auto
 tesseract_executable: tesseract
+tessdata_dir: null
 ocr_languages: chi_sim+eng
-external_timeout: 60
-analysis_revision: "1"    # Change after OCR language data / font / analysis policy updates.
+external_timeout: 120
+analysis_revision: qwen-vision-v1
 vision:
-  mode: disabled          # http requires explicit endpoint, model and revision below.
-  endpoint: ""            # Full chat/completions-compatible endpoint; not just a base URL.
-  model: ""
-  revision: ""
-  api_key_env: DOCQA_VISION_KEY
-  timeout: 60
-  retries: 2
+  mode: http
+  endpoint: https://ai.gitee.com/v1/chat/completions
+  model: Qwen3.6-27B
+  revision: gitee-managed-unpinned
+  api_key_env: GITEE_AI_API_KEY
+  enable_thinking: false
+  timeout: 120
+  retries: 1

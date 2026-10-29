@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import argparse
 import importlib
-from importlib import metadata
-from pathlib import Path
 import platform
 import shutil
 import sqlite3
 import struct
 import sys
-
+from importlib import metadata
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 IMPORT_NAMES = {
@@ -37,8 +36,10 @@ IMPORT_NAMES = {
     "respx": "respx",
     "ruff": "ruff",
     "fastapi": "fastapi",
+    "starlette": "starlette",
     "uvicorn": "uvicorn",
-    "watchdog": "watchdog",
+    "sqlite-vec": "sqlite_vec",
+    "playwright": "playwright",
 }
 
 
@@ -61,11 +62,19 @@ def requirement_lines(path: Path, seen: set[Path]) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dev", action="store_true", help="Check development tools")
-    parser.add_argument("--web", action="store_true", help="Check optional Web tools")
-    parser.add_argument("--service", action="store_true", help="Check optional watcher")
+    # Accepted for compatibility; the consolidated manifest checks all three groups.
     parser.add_argument(
-        "--system", action="store_true",
+        "--dev", action="store_true", help="Compatibility flag: all tools are checked"
+    )
+    parser.add_argument(
+        "--web", action="store_true", help="Compatibility flag: all tools are checked"
+    )
+    parser.add_argument(
+        "--service", action="store_true", help="Compatibility flag: all tools are checked"
+    )
+    parser.add_argument(
+        "--system",
+        action="store_true",
         help="Also check Tesseract and LibreOffice on PATH (not language packs)",
     )
     args = parser.parse_args()
@@ -83,21 +92,12 @@ def main() -> int:
     try:
         from packaging.requirements import Requirement
     except ImportError:
-        print("[FAIL] packaging is missing. Install requirements-dev.txt first.")
+        print("[FAIL] packaging is missing. Install requirements.txt first.")
         return 1
 
-    files = [ROOT / "requirements.txt"]
-    for selected, filename in (
-        (args.dev, "requirements-dev.txt"),
-        (args.web, "requirements-web.txt"),
-        (args.service, "requirements-service.txt"),
-    ):
-        if selected:
-            files.append(ROOT / filename)
     lines: list[str] = []
     seen: set[Path] = set()
-    for path in files:
-        lines.extend(requirement_lines(path, seen))
+    lines.extend(requirement_lines(ROOT / "requirements.txt", seen))
 
     for line in lines:
         req = Requirement(line)

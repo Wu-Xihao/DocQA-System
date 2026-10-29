@@ -321,7 +321,10 @@ def test_real_worker_pins_generation_and_validates_saved_answer(runner_corpus, t
     assert caught.value.code == "SESSION_OWNER_MISMATCH"
 
 
-def test_real_worker_missing_models_returns_saved_failed_answer(runner_corpus, tmp_path):
+@pytest.mark.parametrize("output_format", ["markdown", "table", "mermaid"])
+def test_real_worker_missing_models_returns_saved_failed_answer(
+    runner_corpus, tmp_path, output_format
+):
     index, options, built = runner_corpus
     options = options.model_copy(update={"mode": "http"}, deep=True)
     runner = HeadlessRunner(
@@ -329,7 +332,11 @@ def test_real_worker_missing_models_returns_saved_failed_answer(runner_corpus, t
     )
     receipt = runner.run(
         uuid4().hex,
-        {"question": "SD5993 心跳", "generation_id": built.generation_id},
+        {
+            "question": "SD5993 心跳",
+            "generation_id": built.generation_id,
+            "output_format": output_format,
+        },
         cancelled=lambda: False,
         progress=lambda _: None,
     )
@@ -337,6 +344,7 @@ def test_real_worker_missing_models_returns_saved_failed_answer(runner_corpus, t
     answer = SessionStore(runner.agent_state).load_answer(receipt["answer_id"])
     assert not answer.verified and not answer.production_ready
     assert answer.stop_reason == "MODEL_NOT_CONFIGURED"
+    assert answer.requested_format == output_format
 
 
 def test_real_worker_ignores_inherited_bad_import_path(runner_corpus, tmp_path, monkeypatch):
@@ -360,6 +368,6 @@ def test_real_worker_ignores_inherited_bad_import_path(runner_corpus, tmp_path, 
 
 
 def test_example_config_is_valid_and_does_not_embed_credentials():
-    options = load_options(Path(__file__).resolve().parents[1] / "configs" / "agent.demo.yaml")
+    options = load_options(Path(__file__).resolve().parents[1] / "configs" / "agent.demo.example.yaml")
     assert options.mode == "demo"
     assert options.generator.api_key_env is None

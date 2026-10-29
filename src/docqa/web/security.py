@@ -110,6 +110,7 @@ class LocalSecurity:
         key: bytes,
         port: int = 8765,
         max_body_bytes: int = 65536,
+        max_upload_bytes: int = 104857600,
     ) -> None:
         _require_key(key)
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
@@ -123,6 +124,7 @@ class LocalSecurity:
         self.app = app
         self.key = key
         self.max_body_bytes = max_body_bytes
+        self.max_upload_bytes = max_upload_bytes
         self.allowed_hosts = {f"127.0.0.1:{port}".encode(), f"localhost:{port}".encode()}
         if port == 80:
             self.allowed_hosts.update({b"127.0.0.1", b"localhost"})
@@ -231,19 +233,33 @@ class LocalSecurity:
                     return
 
         buffered: bytes | None = None
+        binary_upload = method == "PUT" and re.fullmatch(
+            r"/api/v1/uploads/[a-f0-9]{32}/content", path
+        )
         if method in {"POST", "PUT", "PATCH"}:
             media_type = headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower()
-            if media_type != b"application/json":
+            if binary_upload:
+                if media_type != b"application/octet-stream":
+                    await self._error(
+                        send, 415, "BINARY_REQUIRED", "Upload requires binary content."
+                    )
+                    return
+                if length is not None and length > self.max_upload_bytes:
+                    await self._error(
+                        send, 413, "BODY_TOO_LARGE", "Upload exceeds the configured limit."
+                    )
+                    return
+            elif media_type != b"application/json":
                 await self._error(
                     send, 415, "JSON_REQUIRED", "The request must use application/json."
                 )
                 return
-            if length is not None and length > self.max_body_bytes:
+            if not binary_upload and length is not None and length > self.max_body_bytes:
                 await self._error(send, 413, "BODY_TOO_LARGE", "The request body is too large.")
                 return
             parts = []
             size = 0
-            while True:
+            while not binary_upload:
                 event = await receive()
                 if event["type"] != "http.request":
                     await self._error(
@@ -262,12 +278,12 @@ class LocalSecurity:
                     parts.append(part)
                 if not event.get("more_body", False):
                     break
-            if length is not None and length != size:
+            if not binary_upload and length is not None and length != size:
                 await self._error(
                     send, 400, "BODY_LENGTH_MISMATCH", "The body length does not match."
                 )
                 return
-            buffered = b"".join(parts)
+            buffered = None if binary_upload else b"".join(parts)
 
         replayed = False
 

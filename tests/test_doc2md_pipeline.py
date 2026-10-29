@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -16,7 +17,7 @@ from docqa.cli.main import app
 from docqa.doc2md.common import ParseContext
 from docqa.doc2md.config import ParseOptions, VisionConfig, load_options
 from docqa.doc2md.pipeline import batch_parse, parse_document, verify_artifact
-from docqa.doc2md.security import inspect_snapshot
+from docqa.doc2md.security import inspect_snapshot, io_path
 from docqa.domain.documents import VisionDescription, VisionEntity
 from docqa.domain.errors import DocQAError
 
@@ -73,6 +74,27 @@ def test_image_without_vision_is_explicit_review(tmp_path):
     assert not result.eligible_for_indexing
     assert any(warning.code == "VISION_DISABLED" for warning in result.warnings)
     assert verify_artifact(result.artifact_dir)["valid"]
+
+
+def test_verify_relocated_artifact_with_paths_beyond_windows_max_path(tmp_path):
+    parsed = parse_document(
+        write_docx(tmp_path / "long-path.docx", image=True),
+        tmp_path / "short",
+        options=options(),
+    )
+    relocated = tmp_path / "relocated"
+    while len(str(relocated)) < 270:
+        relocated /= "long-artifact-path"
+    shutil.copytree(tmp_path / "short", io_path(relocated))
+    directory = relocated / "artifacts" / parsed.artifact_id
+    assert len(str(directory / "manifest.json")) > 260
+    assert verify_artifact(directory)["valid"]
+    ir = json.loads(io_path(directory / "document.ir.json").read_bytes())
+    asset = directory / ir["assets"][0]["relative_path"]
+    io_path(asset).write_bytes(b"tampered")
+    with pytest.raises(DocQAError) as failure:
+        verify_artifact(directory)
+    assert failure.value.code == "ARTIFACT_CORRUPT"
 
 
 def test_injected_vision_is_recorded_and_cached(tmp_path):

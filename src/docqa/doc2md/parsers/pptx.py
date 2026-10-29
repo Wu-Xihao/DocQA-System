@@ -286,9 +286,23 @@ class _PptxParser:
             if slide.has_notes_slide:
                 notes = slide.notes_slide.notes_text_frame
                 if notes is not None and notes.text.strip():
-                    self.warn(
-                        "SPEAKER_NOTES_NOT_PARSED",
-                        "PPTX speaker notes are outside native slide extraction",
+                    self.append_block(
+                        "note",
+                        SourceLocator(
+                            locator_type="pptx_shape",
+                            slide=number,
+                            precision="exact_object",
+                            native_ref={
+                                "part": str(slide.notes_slide.part.partname),
+                                "object": "speaker_notes",
+                                "slide_id": int(slide.slide_id),
+                            },
+                            display_label=f"Slide {number}, speaker notes",
+                            doc_id=self.ctx.doc_id,
+                            revision_id=self.ctx.revision_id,
+                        ),
+                        notes.text,
+                        metadata={"content_role": "speaker_notes", "not_visible_on_slide": True},
                     )
             # Master/layout/background graphics can be visible without being in
             # slide.shapes.  Record this coverage gap for the rendering pass.

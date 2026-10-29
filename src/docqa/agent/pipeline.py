@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -9,19 +10,23 @@ from uuid import uuid4
 from docqa.agent.citations import (
     build_citations,
     retain_supported,
+    validate_builtin_draft,
     validate_draft,
     validate_support_report,
 )
 from docqa.agent.config import AgentOptions
-from docqa.agent.evidence import build_evidence_items, revalidate_evidence
+from docqa.agent.evidence import build_evidence_items, revalidate_evidence_batch
+from docqa.agent.performance import PhaseMetrics, balanced_evidence
 from docqa.agent.planning import conservative_plan, validate_plan
 from docqa.agent.providers import make_chat_clients
 from docqa.agent.rendering import render_answer
 from docqa.agent.retrieval import CandidateLedger, Subquery, normalize_query
 from docqa.agent.sessions import SessionStore
 from docqa.doc2md.security import is_within
+from docqa.docbase.admission import COVERAGE_WARNING, has_coverage_gaps
+from docqa.docbase.analyzer import Analyzer
 from docqa.docbase.providers import make_providers
-from docqa.docbase.retrieval import generation_directory
+from docqa.docbase.retrieval import generation_directory, validate_recall_selection
 from docqa.docbase.storage import load_generation
 from docqa.domain.answers import (
     AnswerDraft,
@@ -36,10 +41,14 @@ from docqa.domain.errors import DocQAError
 
 
 class CallBudget:
-    def __init__(self, options):
+    def __init__(self, options, metrics=None):
         self.deadline = time.monotonic() + options.deadline_seconds
         self.maximum = options.max_model_calls
         self.used = 0
+        self.metrics = metrics or PhaseMetrics()
+
+    def remaining(self):
+        return max(0.0, self.deadline - time.monotonic())
 
     def check(self):
         if time.monotonic() >= self.deadline:
@@ -52,7 +61,9 @@ class CallBudget:
         if self.used >= self.maximum:
             raise DocQAError("AGENT_MODEL_BUDGET_EXCEEDED", "Model task budget exhausted")
         self.used += 1
-        result = function(*args, **kwargs, deadline=self.deadline)
+        result = self.metrics.call(
+            "chat." + function.__name__, function, *args, **kwargs, deadline=self.deadline
+        )
         self.check()
         return result
 
@@ -194,7 +205,9 @@ def _publish(
     warnings,
     caller,
     options,
+    performance=None,
 ):
+    publishing_started = time.perf_counter()
     supported_topics = {topic for claim in draft.claims for topic in claim.topic_ids}
     if report is not None:
         supported_topics.intersection_update(
@@ -212,6 +225,32 @@ def _publish(
     else:
         status = "answered"
     items = store.items(session.session_id, caller=caller)
+    used_documents = {item.doc_id for item in items if item.evidence_id in draft.used_evidence_ids}
+    with load_generation(
+        generation_directory(session.index_path, session.generation_id)
+    ) as generation:
+        partial_source = any(
+            has_coverage_gaps(member)
+            and (
+                member["doc_id"] in used_documents
+                if used_documents
+                else (
+                    (
+                        session.hard_filters.doc_ids is None
+                        or member["doc_id"] in session.hard_filters.doc_ids
+                    )
+                    and (
+                        session.hard_filters.categories is None
+                        or member["category"] in session.hard_filters.categories
+                    )
+                )
+            )
+            for member in generation.members
+        )
+    if partial_source:
+        warnings = [*warnings, COVERAGE_WARNING]
+        if status == "answered":
+            status = "partial"
     answer_id = uuid4().hex
     semantic = bool(report is not None and not synthetic and (draft.claims or draft.conflicts))
     coverage = [
@@ -266,8 +305,10 @@ def _publish(
         trace=trace,
     )
     item_map = {item.evidence_id: item for item in items}
-    for citation in result.citations:
-        reference = revalidate_evidence(session.index_path, item_map[citation.evidence_id])
+    references = revalidate_evidence_batch(
+        session.index_path, [item_map[citation.evidence_id] for citation in result.citations]
+    )
+    for citation, reference in zip(result.citations, references, strict=True):
         citation.markdown_path = reference["markdown_path"]
         citation.snapshot_path = reference["snapshot_path"]
         citation.image_paths = [image["path"] for image in reference["images"]]
@@ -279,11 +320,31 @@ def _publish(
             "ANSWER_OUTPUT_BUDGET_EXCEEDED",
             "Rendered answer exceeds explicit output bytes; no hidden truncation",
         )
+    if performance is not None:
+        performance.calls.append(
+            {
+                "operation": "publishing",
+                "seconds": round(time.perf_counter() - publishing_started, 6),
+                "succeeded": True,
+            }
+        )
+        result.trace.append(performance.summary())
     store.save_answer(session.session_id, result, result.answer_markdown, caller=caller)
     return result
 
 
-def _failed(store, session, error, *, caller, options, trace, rounds=0):
+def _failed(
+    store,
+    session,
+    error,
+    *,
+    caller,
+    options,
+    trace,
+    rounds=0,
+    output_format="markdown",
+    performance=None,
+):
     current = store.get(session.session_id, caller=caller)
     if current.finalize_attempts_used == 0:
         store.reserve_finalize(session.session_id, caller=caller)
@@ -293,7 +354,7 @@ def _failed(store, session, error, *, caller, options, trace, rounds=0):
         generation_id=session.generation_id,
         question=session.question,
         status="failed",
-        requested_format="markdown",
+        requested_format=output_format,
         verification="not_applicable",
         verified=False,
         synthetic=session.synthetic or options.mode == "demo",
@@ -305,6 +366,8 @@ def _failed(store, session, error, *, caller, options, trace, rounds=0):
         trace=trace,
     )
     result.answer_markdown = render_answer(result)
+    if performance is not None:
+        result.trace.append(performance.summary())
     store.save_answer(session.session_id, result, result.answer_markdown, caller=caller)
     return result
 
@@ -348,8 +411,7 @@ def finalize_answer(
     draft = draft.model_copy(update={"required_topics": topics})
     items = store.items(session_id, caller=caller)
     validate_draft(draft, items, topics)
-    for item in items:
-        revalidate_evidence(session.index_path, item)
+    revalidate_evidence_batch(session.index_path, items)
     budget = budget or CallBudget(options)
     report = None
     if draft.claims or draft.conflicts or draft.diagram_edges:
@@ -416,11 +478,43 @@ def answer_question(
     use_planner=False,
     chat_clients=None,
     retrieval_providers=None,
+    progress=None,
+    context_questions=None,
+    evidence_preview=None,
 ):
+    notify = progress or (lambda stage: None)
+    context_questions = list(context_questions or [])
+    if len(context_questions) > 4 or any(
+        not isinstance(text, str) or len(text) > 1800 for text in context_questions
+    ):
+        raise DocQAError("INVALID_REQUEST", "Conversation context exceeds its budget")
+    model_question = question
+    use_context = bool(
+        context_questions
+        and re.search(
+            r"这|那|它|上述|上面|前面|继续|刚才|之后|呢|\b(it|its|that|those|above|previous|continue)\b",
+            question,
+            re.IGNORECASE,
+        )
+    )
+    if use_context:
+        model_question = (
+            question
+            + "\n\n历史用户问题（仅用于理解追问，不是事实证据）：\n"
+            + "\n".join(context_questions)
+        )
     options = options or AgentOptions()
+    metrics = PhaseMetrics()
     plan = conservative_plan(question, required_topics, output_format)
+    if use_context:
+        # Retain the original question/topic obligation. Only the retrieval
+        # wording gains context; every factual answer still needs fresh evidence.
+        plan.subqueries[0].query = (question + " " + context_questions[-1])[:3900]
     store = _store(index, output)
-    session = create_evidence_session(
+    budget, trace, warnings, rounds, degraded = CallBudget(options, metrics), [], [], 0, False
+    session = metrics.call(
+        "session_prepare",
+        create_evidence_session,
         index,
         question,
         output=output,
@@ -431,9 +525,12 @@ def answer_question(
         generation_id=generation_id,
         required_topics=required_topics,
     )
-    budget, trace, warnings, rounds, degraded = CallBudget(options), [], [], 0, False
     try:
-        with load_generation(generation_directory(index, session.generation_id)) as generation:
+        notify("planning")
+        with metrics.call(
+            "index_load", load_generation, generation_directory(index, session.generation_id)
+        ) as generation:
+            validate_recall_selection(generation, options.retrieval)
             if generation.profiles["mode"] != options.retrieval.mode:
                 raise DocQAError(
                     "PROFILE_MISMATCH", "Retrieval mode differs from the pinned generation"
@@ -466,6 +563,7 @@ def answer_question(
                     warnings=[],
                     caller=caller,
                     options=options,
+                    performance=metrics,
                 )
             generator, verifier = chat_clients or make_chat_clients(options)
             if use_planner:
@@ -507,10 +605,14 @@ def answer_question(
                     "verifier": verifier.fingerprint(),
                 }
             )
-            providers = retrieval_providers or make_providers(options.retrieval)
+            providers = retrieval_providers or make_providers(
+                options.retrieval, deadline=budget.deadline
+            )
             ledger = CandidateLedger(
                 generation,
-                question,
+                question + "\n上下文用户问题：" + context_questions[-1][:900]
+                if use_context
+                else question,
                 options=options.retrieval,
                 providers=providers,
                 topic_order=[topic.topic_id for topic in plan.required_topics],
@@ -527,6 +629,7 @@ def answer_question(
                 None,
             )
             stop = "round_budget"
+            prepared_draft = None
             for round_no in range(1, options.max_rounds + 1):
                 budget.check()
                 pending = [
@@ -537,6 +640,10 @@ def answer_question(
                 pending = pending[
                     : min(options.max_subqueries, options.max_queries - ledger.query_count)
                 ]
+                if round_no > 1 and budget.remaining() < options.finalization_reserve_seconds:
+                    stop = "finalization_time_reserved"
+                    trace.append({"stage": "followup_skipped", "reason": stop})
+                    break
                 if not pending:
                     stop = "no_new_query"
                     break
@@ -545,7 +652,10 @@ def answer_question(
                     for _ in pending
                 ]
                 try:
-                    batch = ledger.collect(
+                    notify("retrieving")
+                    batch = metrics.call(
+                        "retrieval",
+                        ledger.collect,
                         [Subquery(value.query, tuple(value.topic_ids)) for value in pending],
                         round_index=round_no,
                         uncovered_topics=uncovered,
@@ -564,11 +674,30 @@ def answer_question(
                     raise
                 rounds = round_no
                 trace.append({"stage": "retrieve", **batch.trace})
+                metrics.retrieval_rounds.append(
+                    {
+                        "round": rounds,
+                        "recall": [c.get("timings", {}) for c in batch.trace["calls"]],
+                        "rerank_seconds": batch.trace.get("rerank_seconds", 0),
+                        "reranker_state": batch.trace["reranker_state"],
+                        "rerank_candidates": len(batch.trace["rerank_input"]),
+                    }
+                )
                 degraded = degraded or batch.degraded
                 warnings.extend(batch.warnings)
-                items = build_evidence_items(index, session.generation_id, batch.hits)
-                items.sort(key=lambda item: item.is_heading)
-                pack = store.deliver(
+                items = metrics.call(
+                    "evidence_load", build_evidence_items, index, session.generation_id, batch.hits
+                )
+                items = metrics.call(
+                    "evidence_order",
+                    balanced_evidence,
+                    items,
+                    model_question,
+                    Analyzer(options.retrieval.analyzer_terms),
+                )
+                pack = metrics.call(
+                    "evidence_pack",
+                    store.deliver,
                     session.session_id,
                     reservations[0]["reservation_id"],
                     items,
@@ -576,6 +705,11 @@ def answer_question(
                     query_id=uuid4().hex,
                     degraded=batch.degraded,
                     warnings=batch.warnings,
+                    delivery_budget_bytes=max(
+                        1, int(session.max_evidence_bytes * options.initial_evidence_fraction)
+                    )
+                    if round_no == 1 and options.max_rounds > 1
+                    else None,
                 )
                 for reservation in reservations[1:]:
                     store.link_query(
@@ -596,14 +730,46 @@ def answer_question(
                 if not pack.complete:
                     warnings.append("EVIDENCE_OMITTED_BY_BYTE_BUDGET")
                 all_items = store.items(session.session_id, caller=caller)
+                if evidence_preview is not None and all_items:
+                    try:
+                        evidence_preview(all_items)
+                    except (OSError, ValueError):
+                        pass  # Optional progress must never bypass or break answer validation.
                 if not all_items:
                     stop = batch.empty_reason or "evidence_budget"
                     break
-                assessment = _validate_assessment(
-                    budget.invoke(generator.assess, question, plan.required_topics, all_items),
-                    plan,
-                    all_items,
-                )
+                if round_no > 1 and not pack.items and assessment is not None:
+                    stop = "no_new_evidence"
+                    trace.append(
+                        {"stage": "assess_reused", "reason": "identical_delivered_evidence"}
+                    )
+                    break
+                notify("assessing")
+                if options.combine_assessment_and_compose and hasattr(
+                    generator, "assess_and_compose"
+                ):
+                    from docqa.agent.providers import AssessedDraft
+
+                    prepared = AssessedDraft.model_validate(
+                        budget.invoke(
+                            generator.assess_and_compose,
+                            model_question,
+                            plan.required_topics,
+                            all_items,
+                            output_format,
+                        )
+                    )
+                    assessment = _validate_assessment(prepared.assessment, plan, all_items)
+                    prepared_draft = prepared.draft
+                    trace.append({"stage": "assessment_and_draft", "round_no": rounds})
+                else:
+                    assessment = _validate_assessment(
+                        budget.invoke(
+                            generator.assess, model_question, plan.required_topics, all_items
+                        ),
+                        plan,
+                        all_items,
+                    )
                 trace.append(
                     {
                         "stage": "assess",
@@ -621,9 +787,6 @@ def answer_question(
                     break
                 if not uncovered:
                     stop = "topics_covered"
-                    break
-                if round_no > 1 and not pack.items:
-                    stop = "no_new_evidence"
                     break
                 pending = assessment.followup_queries
                 if not pending:
@@ -655,27 +818,47 @@ def answer_question(
                     warnings=warnings,
                     caller=caller,
                     options=options,
+                    performance=metrics,
                 )
+            repair_feedback = None
             for attempt in range(options.max_finalize_attempts):
                 store.reserve_finalize(session.session_id, caller=caller)
+                notify("composing")
                 draft = AnswerDraft.model_validate(
-                    budget.invoke(
+                    prepared_draft
+                    if attempt == 0 and prepared_draft is not None
+                    else budget.invoke(
                         generator.compose,
-                        question,
+                        model_question,
                         plan.required_topics,
                         all_items,
                         assessment,
                         output_format,
                         repair=attempt > 0,
+                        **(
+                            {"repair_feedback": repair_feedback}
+                            if getattr(generator, "supports_repair_feedback", False)
+                            else {}
+                        ),
                     )
                 )
                 draft = draft.model_copy(update={"required_topics": plan.required_topics})
+                notify("validating")
                 try:
                     if draft.requested_format != output_format:
                         raise DocQAError(
                             "ANSWER_INVALID", "Composer changed the requested output format"
                         )
-                    validate_draft(draft, all_items, plan.required_topics)
+                    draft, reconciled = validate_builtin_draft(
+                        draft, all_items, plan.required_topics
+                    )
+                    if reconciled:
+                        trace.append(
+                            {
+                                "stage": "citation_bookkeeping_reconciled",
+                                "field": "used_evidence_ids",
+                            }
+                        )
                     conflicted = {
                         value.topic_id
                         for value in assessment.coverage
@@ -687,10 +870,10 @@ def answer_question(
                         raise DocQAError(
                             "ANSWER_INVALID", "Composer omitted an observed topic conflict"
                         )
-                    for item in all_items:
-                        revalidate_evidence(index, item)
+                    metrics.call("evidence_validate", revalidate_evidence_batch, index, all_items)
+                    notify("verifying")
                     report = SupportReport.model_validate(
-                        budget.invoke(verifier.verify, question, draft, all_items)
+                        budget.invoke(verifier.verify, model_question, draft, all_items)
                     )
                     validate_support_report(draft, report)
                     retained = retain_supported(draft, report)
@@ -699,17 +882,37 @@ def answer_question(
                         len(retained.conflicts),
                         len(retained.diagram_edges),
                     ) != (len(draft.claims), len(draft.conflicts), len(draft.diagram_edges))
-                    if incomplete and attempt == 0:
+                    if (
+                        incomplete
+                        and attempt == 0
+                        and (budget.remaining() >= options.finalization_reserve_seconds)
+                    ):
                         trace.append(
                             {
                                 "stage": "repair",
                                 "reason": "unsupported_items_removed_on_final_attempt",
                             }
                         )
+                        repair_feedback = {
+                            "validation_code": "SUPPORT_REPORT_INVALID",
+                            "validation_rule": "unsupported_items",
+                            "previous_draft": draft.model_dump(
+                                mode="json", exclude={"answer_draft"}
+                            ),
+                            "unsupported_claim_ids": [
+                                check.item_id
+                                for check in report.claim_checks
+                                if check.state != "supported"
+                            ],
+                        }
                         continue
                     if incomplete:
                         warnings.append("UNSUPPORTED_ITEMS_REMOVED")
                         stop = "unsupported_items_removed"
+                        if attempt == 0:
+                            trace.append(
+                                {"stage": "repair_skipped", "reason": "finalization_time_reserved"}
+                            )
                     synthetic = (
                         session.synthetic
                         or options.mode == "demo"
@@ -719,6 +922,7 @@ def answer_question(
                         )
                     )
                     budget.check()
+                    notify("publishing")
                     return _publish(
                         store,
                         session,
@@ -734,16 +938,36 @@ def answer_question(
                         + (["SYNTHETIC_DEMO: not real semantic verification"] if synthetic else []),
                         caller=caller,
                         options=options,
+                        performance=metrics,
                     )
                 except DocQAError as exc:
-                    if attempt == 0 and exc.code in {
-                        "ANSWER_INVALID",
-                        "CITATION_INVALID",
-                        "QUOTE_NOT_FOUND",
-                        "SUPPORT_REPORT_INVALID",
-                    }:
-                        trace.append({"stage": "repair", "reason": exc.code})
+                    if (
+                        attempt == 0
+                        and exc.code
+                        in {
+                            "ANSWER_INVALID",
+                            "CITATION_INVALID",
+                            "QUOTE_NOT_FOUND",
+                            "SUPPORT_REPORT_INVALID",
+                        }
+                        and budget.remaining() >= options.finalization_reserve_seconds
+                    ):
+                        rule = getattr(exc, "rule", "answer_structure_invalid")
+                        trace.append(
+                            {"stage": "repair", "reason": exc.code, "validation_rule": rule}
+                        )
+                        repair_feedback = {
+                            "validation_code": exc.code,
+                            "validation_rule": rule,
+                            "previous_draft": draft.model_dump(
+                                mode="json", exclude={"answer_draft"}
+                            ),
+                        }
                         continue
+                    if hasattr(exc, "rule"):
+                        trace.append(
+                            {"stage": "citation_validation_failed", "validation_rule": exc.rule}
+                        )
                     raise
             raise DocQAError("ANSWER_INVALID", "No publishable answer")
     except (DocQAError, OSError, ValueError, TypeError) as exc:
@@ -754,5 +978,13 @@ def answer_question(
         )
         trace.append({"stage": "failed", "code": error.code, "model_tasks": budget.used})
         return _failed(
-            store, session, error, caller=caller, options=options, trace=trace, rounds=rounds
+            store,
+            session,
+            error,
+            caller=caller,
+            options=options,
+            trace=trace,
+            rounds=rounds,
+            output_format=output_format,
+            performance=metrics,
         )

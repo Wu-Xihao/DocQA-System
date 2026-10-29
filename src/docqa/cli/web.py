@@ -35,7 +35,7 @@ def run(config: Annotated[Path | None, typer.Option("--config", "-c")] = None):
 
         fail(
             DocQAError(
-                "WEB_DEPENDENCY_MISSING", "Install requirements-web.txt in the docqa environment"
+                "WEB_DEPENDENCY_MISSING", "Install requirements.txt in the docqa environment"
             )
         )
     except DocQAError as exc:

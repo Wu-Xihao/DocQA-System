@@ -78,6 +78,7 @@ class EvidenceItem(Contract):
     origin: Literal["native", "ocr", "vl_generated"]
     figure_ids: list[str] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)
+    coverage_warnings: list[str] = Field(default_factory=list)
     is_heading: bool = False
     source_ref: str = ""
 

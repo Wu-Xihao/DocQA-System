@@ -1,69 +1,123 @@
 # DocQA System
 
-本地多模态文档问答系统，已交付 **doc2md v0.1**、**DocBase v0.1**、**AGENTS 知识消费 v0.1**、**Service 自动化运维 v0.1** 和 **Web 工作台 v0.1**。
+本地多模态文档问答工作台：PDF / DOCX / PPTX → 可溯源 Markdown → 三路检索 → 有引用的回答、表格、关系图、思维导图和演示文稿。
 
-- **[系统快速启动](Document/系统快速启动指南.md)**：先跑演示，再接入自己的文档与模型。
-- [系统详细架构](Document/DocQA系统详细架构设计与实施方案.md)
-- [doc2md 实现与手动测试](Document/doc2md模块设计实现与测试指南.md)
-- [DocBase 实现与手动测试](Document/DocBase模块设计实现与测试指南.md)
-- [AGENTS 知识消费、问答及手动测试](Document/AGENTS知识消费模块设计实现与测试指南.md)
-- [Service 自动化运维、配置及手动测试](Document/Service自动化运维模块设计实现与测试指南.md)
-- [Web 工作台、无头问答及手动测试](Document/Web应用模块设计实现与测试指南.md)
-- [CodeAgent 消费约定](AGENTS.md)（[AGENT.md 兼容入口](AGENT.md)）
-- [环境安装](Document/环境配置与依赖安装指南.md)
+- [系统设计说明](Document/系统设计说明.md)：当前架构、数据流、存储、校验和实现边界。
+- [知识消费约定](AGENTS.md)：先检索、按证据回答、强制引用与原图核对。
+- 配置只提交 `configs/*.example.yaml` 和 `configs/.env.example`；资料、密钥和运行数据不入库。
 
-在项目根目录、Python 3.12 的 docqa 环境执行：
+## 1. 安装环境
 
-```text
-python scripts/docqa.py doc2md --help
-python scripts/generate_doc2md_samples.py --output runtime/manual-input
-python scripts/docqa.py doc2md parse runtime/manual-input/text.pdf --output runtime/doc2md --strict
+在项目根目录使用 **Python 3.12、64 位**。已有 conda 环境时直接激活，无须重建。
+
+```powershell
+conda create -n docqa python=3.12 -y
+conda activate docqa
+python -m pip install -r requirements.txt
+python -m pip install -e . --no-deps
+python scripts/check_environment.py
+python -m pip check
 ```
 
-结果 JSON 的 `markdown_path` 指向 Markdown。`complete` 与 `review_required/partial` 分别表示完整解析和待复核；图片未配置 VL、OCR/Office 工具缺失等情况会明确报告，不能当作完整多模态验收通过。
+`requirements.txt` 是唯一完整的应用与测试依赖清单，`pyproject.toml` 从中读取依赖。完整图片解析另需 **Tesseract（chi_sim、eng 语言数据）与 LibreOffice**，加入 PATH，或在 YAML 填可执行文件的绝对路径；它们不是 pip 包。
 
-运行测试（`--basetemp` 使用全新、专用于测试的目录）：
+## 2. 离线演示
 
-```text
-python -m pytest -q --basetemp runtime/pytest-manual-001
+```powershell
+python scripts/prepare_workspace_demo.py
+python scripts/docqa.py web run --config configs/web.demo.example.yaml
 ```
 
-DocBase 离线机制验收（显式 synthetic，不代表真实模型效果）：
+打开 **http://127.0.0.1:8765**。演示使用隔离的 `runtime/workspace-demo-*`，不调用真实模型；`synthetic=true`，不代表真实语义效果。演示为两路，下面的真实配置为三路。切换前按 **Ctrl+C** 停止演示。
 
-```text
-python scripts/generate_docbase_samples.py --output runtime/docbase-manual
-python scripts/docqa.py docbase build runtime/docbase-manual/sources.json --output runtime/docbase --config configs/docbase.demo.yaml
-python scripts/docqa.py docbase query "SD5993 的 FE_HEART_Start 如何启动心跳？" --index runtime/docbase --config configs/docbase.demo.yaml
-python scripts/docqa.py docbase test runtime/docbase-manual/evaluation.json --index runtime/docbase --config configs/docbase.demo.yaml --top-k 2
+## 3. 配置真实模型
+
+复制示例为本机文件，以下命令保留已有文件：
+
+```powershell
+$templates = @{
+  'doc2md.example.yaml' = 'local.doc2md.yaml'
+  'docbase.example.yaml' = 'local.database.yaml'
+  'agent.example.yaml' = 'local.agent.yaml'
+  'service.example.yaml' = 'local.service.yaml'
+  'web.example.yaml' = 'local.web.yaml'
+  '.env.example' = '.env'
+}
+foreach ($name in $templates.Keys) {
+  $destination = Join-Path 'configs' $templates[$name]
+  if (-not (Test-Path -LiteralPath $destination)) {
+    Copy-Item -LiteralPath (Join-Path 'configs' $name) -Destination $destination
+  }
+}
+New-Item -ItemType Directory -Force data/private/documents, data/private/web-uploads | Out-Null
 ```
 
-内置问答与原文回源（复用上面的演示索引）：
+在 `configs/.env` 填 `DASHSCOPE_API_KEY`、`DASHSCOPE_EMBEDDING_ENDPOINT`、`GITEE_AI_API_KEY`、`DEEPSEEK_API_KEY`。Endpoint 必须是控制台提供的**完整原生 text-embedding URL**，不能填 OpenAI 兼容 embeddings URL。环境文件不会自动载入，后面的真实命令统一通过 dotenv 启动。
 
-```text
-python scripts/docqa.py ask "SD5993 的 FE_HEART_Start 如何启动心跳？" --index runtime/docbase --state runtime/agent --config configs/agent.demo.yaml
-python scripts/docqa.py source resolve --answer <返回的answer_id> --citation C0001 --state runtime/agent
+| 配置 | 核对内容 |
+| --- | --- |
+| `local.doc2md.yaml` | 单独解析使用；OCR/Office 路径、语言数据、VL、授权目录 |
+| `local.database.yaml` | 独立检索；dense＋BM25＋sparse、维度、重排与准入策略 |
+| `local.service.yaml` | 授权根、类型与间隔；`parse` 为后台实际解析配置，`retrieval` 为建库配置 |
+| `local.web.yaml` | Service 配置、索引/状态/上传目录、Chat、`agent.retrieval`、时间预算 |
+| `local.agent.yaml` | 仅 CLI `ask` / 外部证据会话需要；网页使用 Web 内嵌 Agent |
+
+示例沿用项目当前配置：百炼 `qwen3.7-text-embedding-flash` 联合 dense/sparse，模力方舟 `Qwen3-Reranker-8B` 重排、`Qwen3.6-27B` 视觉解析，DeepSeek `deepseek-flash` 负责回答编排和独立支持检查。**模型 ID、端点及权限以实际部署为准**；视觉产品名称不能直接替代平台接受的 model ID。
+
+- Service `retrieval`、Web `agent.retrieval` 和独立 DocBase 配置必须一致；YAML 不会自动同步或 include。
+- 后台不自动读取 `local.doc2md.yaml`；修改解析参数时同步更新 Service `parse`。
+- 示例授权根与 Web 状态路径按 YAML 所在目录解析；OCR/Office 使用 PATH 或绝对路径。
+- `validated_parts` 仅允许成功组件入库；覆盖不全仍标记 partial，失败图片不作证据。
+
+## 4. 入库与启动
+
+将资料放入 `data/private/documents`，首次登记目录：
+
+```powershell
+python -m dotenv -f configs/.env run -- python scripts/docqa.py service source add data/private/documents --types pdf,docx,pptx --category auto --state runtime/service-user --config configs/local.service.yaml
 ```
 
-`ask` 返回 answer_markdown、状态、引用与验证标识；`agent session` / `answer validate` 为外部 CodeAgent 提供固定版本的证据与草稿校验。demo 始终 synthetic=true、verified=false，不能当作真实语义验收。详细手动测试见 AGENTS 模块指南 M01～M17。
+终端 A 持续维护资料：
 
-按 Service 指南生成并授权测试来源后，可运行自动维护：
-
-```text
-python scripts/docqa.py service source add runtime/service-input-user --types docx --state runtime/service-user --config configs/service.demo.yaml
-python scripts/docqa.py service run --max-ticks 5 --poll-seconds 1 --state runtime/service-user --config configs/service.demo.yaml
-python scripts/docqa.py service status --state runtime/service-user --config configs/service.demo.yaml
+```powershell
+python -m dotenv -f configs/.env run -- python scripts/docqa.py service run --state runtime/service-user --config configs/local.service.yaml
 ```
 
-Service 提供定时/增量摄入、文档/索引/图片管理、持久任务与重启恢复。持续运行使用 `service run`，另一个终端用同一 state 的 `service stop` 协作停止；未自动安装系统服务或计划任务。
+终端 B 启动网页：
 
-网页工作台（复用前面构建的演示索引 `runtime/docbase`）：
-
-```text
-python -m pip install -r requirements-web.txt
-python scripts/docqa.py web doctor --config configs/web.demo.yaml
-python scripts/docqa.py web run --config configs/web.demo.yaml
+```powershell
+python -m dotenv -f configs/.env run -- python scripts/docqa.py web run --config configs/local.web.yaml
 ```
 
-浏览器打开 `http://127.0.0.1:8765`。后台通过固定 Python 无头子进程调用内置受控 Agent，提供范围选择、排队/取消、历史、表格/关系图、引用与原文下载。只监听本机；演示始终明确标记 synthetic。全新目录和真实服务配置见 Web 指南 W01～W08。
+打开 **http://127.0.0.1:8765**，等首批解析和建库完成后提问。文件夹上传只上传文档副本；**浏览器不能持续监控原文件夹**。持续监控需新增服务器可访问的监控目录，且位于 Service 授权根内。
 
-真实 OCR、Office、VL、Embedding / BGE-M3 / Reranker 以及 Chat generator/verifier 需配置外部工具或服务。默认 HTTP 缺配置会失败；Mock 通过不代表真实服务已接通。系统级 GC/迁移与真实外部 CodeAgent 宿主接入尚待完成。
+Web `service_mode: auto` 可驱动上传任务；`external` 需要终端 A 常驻；`disabled` 不自动摄入。普通目录定时维护推荐保留终端 A。进程通过持久队列和锁协调，不需要另装数据库服务。
+
+## 5. 状态、重建与排错
+
+```powershell
+python -m dotenv -f configs/.env run -- python scripts/docqa.py service index status --state runtime/service-user --config configs/local.service.yaml
+python -m dotenv -f configs/.env run -- python scripts/docqa.py service documents --state runtime/service-user --config configs/local.service.yaml
+python -m dotenv -f configs/.env run -- python scripts/docqa.py service job list --state runtime/service-user --config configs/local.service.yaml
+
+# 修改模型、维度、路线、切片或准入策略后，排队重建并执行任务
+python -m dotenv -f configs/.env run -- python scripts/docqa.py service index build --state runtime/service-user --config configs/local.service.yaml
+python -m dotenv -f configs/.env run -- python scripts/docqa.py service run --once --state runtime/service-user --config configs/local.service.yaml
+```
+
+`queued/running` 都不是完成，按返回 job ID 查询，直到 `succeeded`。一次 `run --once` 不保证整个队列清空，未完成则继续运行 Service。索引与配置不一致时同步三处检索配置、完成重建，再重启 Web；历史对话固定旧索引，请升级资料版本或新建对话。
+
+网页无响应先检查终端并 **Ctrl+F5**；`documents=0` 查看文档状态和解析质量；`CITATION_INVALID` 表示草稿引用未通过校验，不应关闭校验。完整解析缺工具或 VL 时补齐后重新解析，详见[设计说明](Document/系统设计说明.md)。
+
+## 6. 开发与数据
+
+```powershell
+python -m ruff check src tests scripts
+python -m pytest -q
+```
+
+Windows 测试使用短临时路径，避免超过路径长度限制。`tests/browser` 为可选 Playwright 浏览器验收，需可用的 Chrome 或另外安装的 Chromium；Node.js 用于前端语法自检。主测试集使用合成资料及模拟接口，不应改为发送私有资料到真实模型。
+
+后台 Markdown 位于 `runtime/service-user/parsed/artifacts/<artifact_id>/document.md`，原始快照、图片、映射和质量报告一同保留。`runtime`、`data/private`、`.env`、本机配置和 `.local-archive` 不提交。旧文档只在当前版本移除，Git 历史未重写。
+
+历史兼容的独立本地 BGE-M3 编码服务不属于当前百炼部署；按需 `pip install -e ".[legacy-sparse]"` 安装额外依赖，无须另一份 requirements 文件。

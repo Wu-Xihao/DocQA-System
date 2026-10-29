@@ -8,11 +8,12 @@ topic-aware round robin precedes one shared reranking operation.
 from __future__ import annotations
 
 import math
+import time
 import unicodedata
 from dataclasses import dataclass, field
 
 from docqa.docbase.config import DocBaseOptions
-from docqa.docbase.retrieval import CandidatePool, collect_candidates
+from docqa.docbase.retrieval import CandidatePool, collect_candidates, validate_recall_selection
 from docqa.domain.errors import DocQAError
 from docqa.domain.rag import RetrievalHit
 
@@ -101,6 +102,7 @@ class CandidateLedger:
             raise DocQAError("INVALID_CONFIG", "Agent degradation permission must be boolean")
         if generation.profiles["mode"] != options.mode:
             raise DocQAError("PROFILE_MISMATCH", "Demo and real retrieval generations differ")
+        validate_recall_selection(generation, options)
         self.generation = generation
         self.generation_id = generation.manifest["generation_id"]
         self.question = original_question
@@ -207,15 +209,22 @@ class CandidateLedger:
                 # Reserve before calling: failed/timeout requests consume budget.
                 self._seen_queries.add(normalized)
                 self._attempted_queries.append(normalized)
-                pool = collect_candidates(
-                    self.generation,
-                    value.query,
-                    options=self.options,
-                    providers=self.providers,
-                    eligible=self.eligible,
-                    mode="hybrid",
-                    allow_degraded=self.allow_degraded,
-                )
+                try:
+                    pool = collect_candidates(
+                        self.generation,
+                        value.query,
+                        options=self.options,
+                        providers=self.providers,
+                        eligible=self.eligible,
+                        mode="hybrid",
+                        allow_degraded=self.allow_degraded,
+                    )
+                except DocQAError as exc:
+                    if exc.code == "MODEL_DEADLINE_EXCEEDED":
+                        raise DocQAError(
+                            "AGENT_DEADLINE_EXCEEDED", "Retrieval exhausted the answer time budget"
+                        ) from exc
+                    raise
                 if any(row not in self.eligible for row in pool.rows):
                     raise DocQAError("RETRIEVAL_FAILED", "A recall route escaped the fixed scope")
                 if any(route.error_code == "PROFILE_MISMATCH" for route in pool.routes.values()):
@@ -239,6 +248,7 @@ class CandidateLedger:
                         "routes": {k: v.model_dump(mode="json") for k, v in pool.routes.items()},
                         "candidate_count": pool.total_candidates,
                         "fused_window_count": len(pool.rows),
+                        "timings": pool.timings,
                     }
                 )
         ordered = self._ordered_lists(uncovered_topics)
@@ -249,9 +259,10 @@ class CandidateLedger:
         representative = {
             row: next(value for value in ordered if row in value.pool.rows) for row in rerank_rows
         }
-        rerank_key = tuple(rerank_rows)
+        rerank_key = tuple(sorted(rerank_rows))
         rerank_scores = dict(self._rerank_cache.get(rerank_key, {}))
         reranker_state = "cached" if rerank_scores else "not_called"
+        rerank_started = time.perf_counter()
         if rerank_rows and prepared and not rerank_scores:
             try:
                 values = self.providers[2].rerank(
@@ -276,12 +287,21 @@ class CandidateLedger:
                 reranker_state = "ok"
             except (DocQAError, OSError, ValueError, TypeError, OverflowError) as exc:
                 code = exc.code if isinstance(exc, DocQAError) else "MODEL_RESPONSE_INVALID"
+                if code == "MODEL_DEADLINE_EXCEEDED":
+                    raise DocQAError(
+                        "AGENT_DEADLINE_EXCEEDED", "Reranking exhausted the answer time budget"
+                    ) from exc
                 if not self.allow_degraded or code == "PROFILE_MISMATCH":
                     raise DocQAError(
                         "RERANK_FAILED", f"Required unified rerank failed: {code}"
                     ) from exc
                 self._warnings.append(f"reranker:{code}; explicit topic-round-robin fallback")
                 reranker_state = "failed"
+        rerank_seconds = (
+            round(time.perf_counter() - rerank_started, 6)
+            if reranker_state in {"ok", "failed"}
+            else 0.0
+        )
         if rerank_scores:
             position = {row: index for index, row in enumerate(rerank_rows)}
             rerank_rows.sort(
@@ -349,6 +369,7 @@ class CandidateLedger:
                     self.generation.chunks[row].chunk_id for row in merged[: self.rerank_top_n]
                 ],
                 "reranker_state": reranker_state,
+                "rerank_seconds": rerank_seconds,
                 "selected_chunks": [hit.chunk_id for hit in hits],
                 "query_lists": [
                     {

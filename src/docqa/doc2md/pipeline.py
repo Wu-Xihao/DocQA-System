@@ -24,7 +24,7 @@ from docqa.doc2md.adapters import HttpVisionClient, LibreOfficeRenderer, Tessera
 from docqa.doc2md.common import ParseContext, digest
 from docqa.doc2md.config import ParseOptions
 from docqa.doc2md.markdown import render_markdown
-from docqa.doc2md.security import inspect_snapshot, is_within, validate_source
+from docqa.doc2md.security import inspect_snapshot, io_path, is_within, validate_source
 from docqa.domain.documents import (
     Block,
     DocumentIR,
@@ -37,12 +37,14 @@ from docqa.domain.errors import DocQAError
 
 
 def _json(path: Path, value) -> None:
-    path.write_bytes((json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+    io_path(path).write_bytes(
+        (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    )
 
 
 def _checksum(path: Path) -> str:
     checksum = sha256()
-    with path.open("rb") as stream:
+    with io_path(path).open("rb") as stream:
         while chunk := stream.read(1024 * 1024):
             checksum.update(chunk)
     return checksum.hexdigest()
@@ -380,7 +382,7 @@ def verify_artifact(artifact_dir: str | Path) -> dict:
     """Validate a complete saved artifact, including source snapshot and source-map offsets."""
     directory = Path(artifact_dir).resolve()
     try:
-        manifest = json.loads((directory / "manifest.json").read_bytes())
+        manifest = json.loads(io_path(directory / "manifest.json").read_bytes())
         if not isinstance(manifest, dict):
             raise ValueError("Artifact manifest must be an object")
         if manifest.get("schema_version") != "docqa.artifact.v1":
@@ -400,9 +402,13 @@ def verify_artifact(artifact_dir: str | Path) -> dict:
             raise ValueError("Manifest omits required artifact files")
         for relative, checksum in manifest["files"].items():
             path = (directory / relative).resolve()
-            if not is_within(path, directory) or not path.is_file() or _checksum(path) != checksum:
+            if (
+                not is_within(path, directory)
+                or not io_path(path).is_file()
+                or _checksum(path) != checksum
+            ):
                 raise ValueError("Artifact file missing or modified")
-        ir = DocumentIR.model_validate_json((directory / "document.ir.json").read_bytes())
+        ir = DocumentIR.model_validate_json(io_path(directory / "document.ir.json").read_bytes())
         if ir.artifact_id != manifest["artifact_id"]:
             raise ValueError("IR identity differs from manifest")
         if digest(_canonical_ir(ir)) != ir.artifact_id:
@@ -414,10 +420,10 @@ def verify_artifact(artifact_dir: str | Path) -> dict:
             raise ValueError("Invalid revision identity")
         if digest([ir.revision_id, ir.parse_profile_id]) != manifest["parse_key"]:
             raise ValueError("Invalid parse key")
-        profile = json.loads((directory / "profile.json").read_bytes())
+        profile = json.loads(io_path(directory / "profile.json").read_bytes())
         if digest(profile) != ir.parse_profile_id:
             raise ValueError("Profile differs from parse profile identity")
-        quality = json.loads((directory / "quality_report.json").read_bytes())
+        quality = json.loads(io_path(directory / "quality_report.json").read_bytes())
         if quality != manifest["quality"] or quality != _quality(ir):
             raise ValueError("Quality report differs from IR or manifest")
         block_ids = [block.block_id for block in ir.blocks]
@@ -456,8 +462,8 @@ def verify_artifact(artifact_dir: str | Path) -> dict:
                     ir.artifact_id,
                 ):
                     raise ValueError("Locator version mismatch")
-        markdown = (directory / "document.md").read_bytes()
-        source_map = json.loads((directory / "source_map.json").read_bytes())
+        markdown = io_path(directory / "document.md").read_bytes()
+        source_map = json.loads(io_path(directory / "source_map.json").read_bytes())
         if b"\r" in markdown or sha256(markdown).hexdigest() != source_map["markdown_sha256"]:
             raise ValueError("Markdown digest or newline mismatch")
         if [entry["block_id"] for entry in source_map["entries"]] != block_ids:
@@ -559,7 +565,10 @@ def _parse_document(
     (root / "artifacts").mkdir(exist_ok=True)
     try:
         ocr = ocr_client or TesseractOCR(
-            options.tesseract_executable, options.ocr_languages, options.external_timeout
+            options.tesseract_executable,
+            options.ocr_languages,
+            options.external_timeout,
+            tessdata_dir=options.tessdata_dir,
         )
         renderer = office_renderer or LibreOfficeRenderer(
             options.office_executable, options.external_timeout
@@ -573,7 +582,14 @@ def _parse_document(
         v = options.vision
         try:
             vision = HttpVisionClient(
-                v.endpoint, v.model, v.revision, v.api_key_env, v.timeout, v.retries
+                v.endpoint,
+                v.model,
+                v.revision,
+                v.api_key_env,
+                v.timeout,
+                v.retries,
+                thinking=v.thinking,
+                enable_thinking=v.enable_thinking,
             )
         except ValueError as exc:
             raise DocQAError(
@@ -658,7 +674,7 @@ def _parse_locked(
         if cached:
             directory = root / "artifacts" / cached[0]
             verify_artifact(directory)
-            previous = json.loads((directory / "manifest.json").read_bytes())
+            previous = json.loads(io_path(directory / "manifest.json").read_bytes())
             # An unavailable service/key must not permanently cache a partial result.
             if previous["quality"]["status"] == "complete":
                 return _result(previous, directory, reused=True)
@@ -693,6 +709,12 @@ def _parse_locked(
             if fmt in {"docx", "pptx"}:
                 _add_office_render(content, ctx, renderer, options, preflight)
         _enrich(content, ctx, options, ocr, vision, root)
+        from docqa.doc2md.figure_names import name_figures
+
+        name_figures(content, ctx)
+        from docqa.doc2md.classification import classify
+
+        category = classify(content, source.name, options.category)
         assets = {asset.asset_id: asset for asset in [*ctx.raw_assets.values(), *content.assets]}
         ir = DocumentIR(
             **content.model_dump(exclude={"assets"}),
@@ -703,7 +725,7 @@ def _parse_locked(
             parse_profile_id=profile_id,
             source_name=source.name,
             source_format=fmt,
-            category=options.category,
+            category=category,
         )
         for block in ir.blocks:
             for location in block.locators:

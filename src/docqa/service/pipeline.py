@@ -8,9 +8,12 @@ prevents a live old worker and a restarted worker from publishing concurrently.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import threading
 import time
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -21,6 +24,7 @@ import portalocker
 from docqa.doc2md.common import digest
 from docqa.doc2md.pipeline import parse_document, verify_artifact
 from docqa.doc2md.security import is_within
+from docqa.docbase.admission import has_coverage_gaps
 from docqa.docbase.pipeline import build_index
 from docqa.docbase.storage import _io_path, load_generation, read_current, verify_generation
 from docqa.domain.documents import DocumentIR
@@ -177,11 +181,55 @@ class Service:
     def list_sources(self):
         return self.registry.list("sources")
 
-    def update_source(self, source_id, *, enabled=None, category=None, interval_seconds=None):
+    def update_source(
+        self,
+        source_id,
+        *,
+        enabled=None,
+        category=None,
+        interval_seconds=None,
+        types=None,
+        recursive=None,
+    ):
+        if recursive is not None and type(recursive) is not bool:
+            raise DocQAError("INVALID_REQUEST", "Recursive must be Boolean")
+        try:
+            selected_types = normalize_types(types) if types is not None else None
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise DocQAError("INVALID_REQUEST", "Invalid document types") from exc
+        if (
+            selected_types
+            and {"doc", "ppt"} & set(selected_types)
+            and not self.options.parse.allow_legacy_office
+        ):
+            raise DocQAError("UNSUPPORTED_FORMAT", "Legacy types need explicit conversion")
+        policy_changed = False
         with self._mutation():
             source = self.registry.get("sources", source_id)
             if source["removed"]:
                 raise DocQAError("SOURCE_REMOVED", "Source was removed")
+            for key, value in (("types", selected_types), ("recursive", recursive)):
+                if value is not None and value != source[key]:
+                    source[key] = value
+                    policy_changed = True
+            if policy_changed:
+                for doc in self.registry.list("documents"):
+                    if doc["source_id"] != source_id:
+                        continue
+                    eligible = Path(doc["path"]).suffix.lower().lstrip(".") in source["types"] and (
+                        source["recursive"] or Path(doc["path"]).parent == Path(source["path"])
+                    )
+                    if not eligible and not doc["removed"]:
+                        doc.update(removed=True, removal_reason="source_policy", state="removed")
+                    elif eligible and doc["removal_reason"] == "source_policy":
+                        doc.update(
+                            removed=False,
+                            removal_reason=None,
+                            state="pending",
+                            target_version=doc["target_version"] + 1,
+                        )
+                    self.registry.put("documents", doc)
+                self.registry.bump()
             if enabled is not None:
                 if type(enabled) is not bool:
                     raise DocQAError("INVALID_REQUEST", "Enabled must be Boolean")
@@ -193,18 +241,21 @@ class Service:
             if category is not None:
                 if not isinstance(category, str) or not category.strip() or len(category) > 256:
                     raise DocQAError("INVALID_REQUEST", "Invalid category")
-                source["category"] = category.strip()
-                for doc in self.registry.list("documents"):
-                    if doc["source_id"] == source_id and not doc["removed"]:
-                        doc["category"] = source["category"]
-                        doc["target_version"] += 1
-                        doc["state"] = "pending"
-                        self.registry.put("documents", doc)
-                self.registry.bump()
+                if category.strip() != source["category"]:
+                    source["category"] = category.strip()
+                    for doc in self.registry.list("documents"):
+                        if doc["source_id"] == source_id and not doc["removed"]:
+                            doc["category"] = source["category"]
+                            doc["target_version"] += 1
+                            doc["state"] = "pending"
+                            self.registry.put("documents", doc)
+                    self.registry.bump()
             source["next_scan_at"] = self.clock()
             self.registry.put("sources", source)
         if source["enabled"]:
             self.enqueue_scan(source_id)
+        if policy_changed:
+            self.enqueue_build()
         return source
 
     def remove_source(self, source_id):
@@ -555,7 +606,7 @@ class Service:
             deep=True,
             update={
                 "allowed_roots": [root],
-                "category": doc["category"],
+                "category": "auto" if source["category"] == "auto" else doc["category"],
                 "analysis_revision": f"{self.options.parse.analysis_revision}.service-{doc['analysis_epoch']}",
             },
         )
@@ -581,6 +632,7 @@ class Service:
                 if current["target_version"] != target or current["removed"]:
                     return {"status": "skipped", "reason": "target_superseded"}
                 current["latest_attempt_artifact"] = result.artifact_dir
+                current["category"] = ir.category
                 if result.eligible_for_indexing:
                     current.update(
                         artifact_dir=result.artifact_dir,
@@ -635,6 +687,35 @@ class Service:
                 for item in docs
                 if not item["removed"] and item["artifact_dir"]
             ]
+        if self.options.retrieval.incomplete_policy in {"native_only", "validated_parts"}:
+            from docqa.docbase.pipeline import _source_record
+
+            selected = {
+                doc["doc_id"]: Path(doc["artifact_dir"])
+                for doc in docs
+                if not doc["removed"] and doc["artifact_dir"]
+            }
+            for doc in docs:
+                if (
+                    doc["removed"]
+                    or doc["state"] != "review_required"
+                    or not doc["latest_attempt_artifact"]
+                ):
+                    continue
+                candidate = canonical_path(doc["latest_attempt_artifact"], directory=True)
+                if not is_within(candidate, self.parsed):
+                    raise DocQAError(
+                        "SOURCE_ACCESS_DENIED", "Candidate is outside managed parse assets"
+                    )
+                try:
+                    ir, _, _ = _source_record(candidate, self.options.retrieval.incomplete_policy)
+                except DocQAError as error:
+                    if error.code in {"SOURCE_NOT_READY", "NO_INDEXABLE_CONTENT"}:
+                        continue
+                    raise
+                if ir.doc_id == doc["doc_id"] and ir.content_sha256 == doc["desired_sha256"]:
+                    selected[doc["doc_id"]] = candidate
+            paths = list(selected.values())
         result = self.build_function(
             paths,
             self.index,
@@ -661,25 +742,141 @@ class Service:
         with load_generation(self.index / "generations" / generation) as selected:
             return {item["doc_id"]: item for item in selected.members}
 
+    def _ingestion_diagnostics(self):
+        documents = [item for item in self.list_documents() if not item["removed"]]
+        states = Counter(item["state"] for item in documents)
+        blocked = [item for item in documents if item["state"] in {"review_required", "failed"}]
+        details = []
+        for doc in blocked[:20]:
+            item = {
+                "doc_id": doc["doc_id"],
+                "state": doc["state"],
+                "error_code": doc.get("error_code"),
+                "warning_counts": {},
+            }
+            artifact = doc.get("latest_attempt_artifact")
+            # A tool failure may leave an older completed attempt in metadata.
+            # Do not present its warnings as the cause of this newer failure.
+            if artifact and doc["state"] == "review_required":
+                try:
+                    directory = canonical_path(artifact, directory=True)
+                    if not is_within(directory, self.parsed):
+                        raise ValueError("Diagnostic report is outside managed parse assets")
+                    report = canonical_path(directory / "quality_report.json", directory=False)
+                    if report.stat().st_size > 1024 * 1024:
+                        raise ValueError("Diagnostic report exceeds supported size")
+                    value = json.loads(_io_path(report).read_bytes())
+                    warnings = value.get("warnings", [])
+                    if not isinstance(warnings, list):
+                        raise ValueError("Malformed diagnostic warnings")
+                    counts = Counter(
+                        warning["code"]
+                        for warning in warnings
+                        if isinstance(warning, dict)
+                        and isinstance(warning.get("code"), str)
+                        and re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", warning["code"])
+                    )
+                    item["warning_counts"] = dict(list(sorted(counts.items()))[:64])
+                except (OSError, DocQAError, ValueError, TypeError, AttributeError):
+                    item["diagnostic_error"] = "QUALITY_REPORT_UNAVAILABLE"
+            details.append(item)
+        return {
+            "discovered_documents": len(documents),
+            "document_states": dict(sorted(states.items())),
+            "blocked_documents": len(blocked),
+            "review_required_documents": states.get("review_required", 0),
+            "partial_documents": 0,
+            "blockers": details,
+            "blockers_truncated": len(blocked) > len(details),
+        }
+
     def index_status(self):
+        diagnostics = self._ingestion_diagnostics()
+        desired = self.registry.meta("desired_revision", 0)
+        assembled = self.registry.meta("assembled_revision", 0)
+        diagnostics.update(
+            desired_revision=desired,
+            assembled_revision=assembled,
+            synced_revision=self.registry.meta("synced_revision", 0),
+        )
+        diagnostics["ingestion_status"] = (
+            "processing"
+            if any(diagnostics["document_states"].get(state) for state in ("pending", "settling"))
+            else "blocked"
+            if diagnostics["blocked_documents"]
+            else "build_failed"
+            if desired != assembled and self.registry.meta("failed_build_revision") == desired
+            else "awaiting_publication"
+            if desired != assembled
+            else "ready"
+            if diagnostics["discovered_documents"]
+            else "no_documents"
+        )
         if not self.index.exists():
             return dict(
-                index_path=str(self.index), generation_id=None, documents=0, status="not_built"
+                index_path=str(self.index),
+                generation_id=None,
+                documents=0,
+                indexed_documents=0,
+                status="not_built",
+                **diagnostics,
             )
         generation, sequence = read_current(self.index)
         if generation is None:
             return dict(
-                index_path=str(self.index), generation_id=None, documents=0, status="not_built"
+                index_path=str(self.index),
+                generation_id=None,
+                documents=0,
+                indexed_documents=0,
+                status="not_built",
+                **diagnostics,
             )
         with load_generation(self.index / "generations" / generation) as selected:
+            partial_members = [member for member in selected.members if has_coverage_gaps(member)]
+            diagnostics["partial_documents"] = len(partial_members)
+            docs = {doc["doc_id"]: doc for doc in self.list_documents() if not doc["removed"]}
+            admitted = {
+                member["doc_id"]
+                for member in partial_members
+                if member["doc_id"] in docs
+                and docs[member["doc_id"]]["state"] == "review_required"
+                and Path(docs[member["doc_id"]].get("latest_attempt_artifact") or "").name
+                == member["artifact_id"]
+            }
+            diagnostics["blocked_documents"] -= len(admitted)
+            diagnostics["coverage_gaps"] = [
+                detail for detail in diagnostics["blockers"] if detail["doc_id"] in admitted
+            ]
+            diagnostics["blockers"] = [
+                detail for detail in diagnostics["blockers"] if detail["doc_id"] not in admitted
+            ]
+            diagnostics["blockers_truncated"] = diagnostics["blocked_documents"] > len(
+                diagnostics["blockers"]
+            )
+            diagnostics["coverage_gaps_truncated"] = len(admitted) > len(
+                diagnostics["coverage_gaps"]
+            )
+            if (
+                partial_members
+                and not diagnostics["blocked_documents"]
+                and desired == assembled
+                and not any(
+                    diagnostics["document_states"].get(state) for state in ("pending", "settling")
+                )
+            ):
+                diagnostics["ingestion_status"] = "ready_with_gaps"
             return dict(
                 index_path=str(self.index),
                 generation_id=generation,
                 publish_sequence=sequence,
                 documents=len(selected.members),
+                indexed_documents=len(selected.members),
                 chunks=len(selected.chunks),
+                vector_backend=selected.profiles.get("vector_backend", "numpy"),
+                recall_routes=selected.profiles.get("recall_routes", ["dense", "bm25", "sparse"]),
                 synthetic=selected.manifest["synthetic"],
                 status="ok",
+                **diagnostics,
             )
 
     def verify_index(self, generation_id=None):

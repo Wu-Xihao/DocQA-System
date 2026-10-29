@@ -51,6 +51,10 @@ def render_answer(result: AnswerResult, *, answer_dir: Path | None = None) -> st
         lines.append("> 演示摘录：使用合成检索或检查机制，未经真实模型语义验收。")
     if result.degraded:
         lines.append("> 本次检索存在降级，缺失能力见诊断；不能据此推定未检索内容。")
+    if any(warning.startswith("SOURCE_COVERAGE_PARTIAL:") for warning in result.warnings):
+        lines.append(
+            "> 来源仍有解析缺口：仅使用通过当前准入规则的内容，不推断未解析或不确定部分。"
+        )
     if result.requested_format == "table" and result.claims:
         lines.extend(["| 有据内容 | 类型 | 来源 |", "| --- | --- | --- |"])
         lines.extend(

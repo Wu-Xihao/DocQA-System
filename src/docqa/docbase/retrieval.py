@@ -5,22 +5,45 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
 from docqa.doc2md.common import digest
 from docqa.docbase.analyzer import Analyzer
 from docqa.docbase.config import DocBaseOptions
+from docqa.docbase.dashscope import shared_encoder
 from docqa.docbase.lexical import search_bm25, search_sparse
 from docqa.docbase.pipeline import _dense_value, _sparse_value
 from docqa.docbase.providers import make_providers
-from docqa.docbase.storage import load_generation, read_current, search_dense
+from docqa.docbase.storage import (
+    generation_recall_routes,
+    load_generation,
+    read_current,
+    search_dense,
+)
 from docqa.domain.errors import DocQAError
 from docqa.domain.rag import QueryResult, RetrievalHit, RouteResult
 
 MODES = {"hybrid", "rrf", "dense", "bm25", "sparse"}
+
+
+def validate_recall_selection(generation, options, mode="hybrid"):
+    """Reject route drift before filters or empty indexes can bypass the check."""
+    if tuple(options.recall_routes) != generation_recall_routes(generation.profiles):
+        raise DocQAError("PROFILE_MISMATCH", "Recall routes differ from the frozen generation")
+    stored_policy = generation.profiles.get("incomplete_policy", "reject")
+    # An existing native-only generation is a safe subset: no image is retroactively admitted.
+    if stored_policy != options.incomplete_policy and not (
+        stored_policy == "native_only" and options.incomplete_policy == "validated_parts"
+    ):
+        raise DocQAError(
+            "PROFILE_MISMATCH", "Source admission policy differs from the frozen generation"
+        )
+    if mode not in {"hybrid", "rrf"} and mode not in options.recall_routes:
+        raise DocQAError("INVALID_REQUEST", "Requested recall route is disabled")
 
 
 def generation_directory(index: str | Path, generation_id: str | None = None) -> Path:
@@ -67,18 +90,27 @@ class CandidatePool:
     routes: dict[str, RouteResult]
     warnings: list[str]
     total_candidates: int
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 def collect_candidates(
     generation, question, *, options, providers, eligible, mode="hybrid", allow_degraded=False
 ):
     """Return the fused window BEFORE final TOP-K; later Agent can merge subqueries."""
+    validate_recall_selection(generation, options, mode)
     dense, sparse, _ = providers
-    required = ("dense", "bm25", "sparse") if mode in {"hybrid", "rrf"} else (mode,)
+    joint = shared_encoder(dense, sparse)
+    joint_future = None
+    # hybrid/rrf recall from the configured recall_routes, so a two-route
+    # generation (dense + bm25) needs no sparse encoder. Single-route modes
+    # keep their explicit route as before.
+    required = tuple(options.recall_routes) if mode in {"hybrid", "rrf"} else (mode,)
     analyzer = Analyzer(options.analyzer_terms)
     if analyzer.profile() != generation.profiles["analyzer"]:
         raise DocQAError("PROFILE_MISMATCH", "BM25 analyzer differs from the frozen generation")
     for route, provider in (("dense", dense), ("sparse", sparse)):
+        if route in required and provider is None:
+            raise DocQAError("MODEL_NOT_CONFIGURED", "Enabled recall encoder is unavailable")
         if route in required and provider.fingerprint() != generation.profiles[route]:
             raise DocQAError(
                 "PROFILE_MISMATCH",
@@ -86,16 +118,35 @@ def collect_candidates(
             )
 
     def encode_dense():
-        values = dense.encode([question], input_type="query")
+        values = (
+            [pair["dense"] for pair in joint_future.result()]
+            if joint_future is not None
+            else dense.encode([question], input_type="query")
+        )
         if not isinstance(values, list) or len(values) != 1:
             raise DocQAError(
                 "MODEL_RESPONSE_INVALID", "Query encoder returned an incomplete result"
             )
         vector = _dense_value(values[0], generation.vectors.shape[1])
+        if generation.profiles.get("vector_backend") == "sqlite_vec":
+            from docqa.docbase.vector_db import search
+
+            return search(
+                generation.directory / "dense/vectors.sqlite",
+                vector,
+                eligible,
+                options.route_top_n,
+                dimension=generation.vectors.shape[1],
+                rows=len(generation.vectors),
+            )
         return search_dense(generation.vectors, vector, eligible, options.route_top_n)
 
     def encode_sparse():
-        values = sparse.encode([question], input_type="query")
+        values = (
+            [pair["sparse"] for pair in joint_future.result()]
+            if joint_future is not None
+            else sparse.encode([question], input_type="query")
+        )
         if not isinstance(values, list) or len(values) != 1:
             raise DocQAError(
                 "MODEL_RESPONSE_INVALID", "Sparse query encoder returned an incomplete result"
@@ -111,10 +162,23 @@ def collect_candidates(
         ),
     }
     results, diagnostics, warnings = {}, {}, []
+    timings = {}
+
+    def timed_route(route):
+        started = time.perf_counter()
+        try:
+            return functions[route]()
+        finally:
+            timings[route] = round(time.perf_counter() - started, 6)
+
     with ThreadPoolExecutor(
         max_workers=len(required), thread_name_prefix="docbase-recall"
     ) as executor:
-        futures = {route: executor.submit(functions[route]) for route in required}
+        if joint is not None and {"dense", "sparse"}.intersection(required):
+            # Submit first: even a single-route pool cannot deadlock waiting for its encoder.
+            # A failed joint response fails both routes; it never becomes BM25-only silently.
+            joint_future = executor.submit(joint.encode, [question], "query")
+        futures = {route: executor.submit(timed_route, route) for route in required}
         for route, future in futures.items():
             try:
                 values = future.result()
@@ -126,6 +190,8 @@ def collect_candidates(
                 code = exc.code if isinstance(exc, DocQAError) else "MODEL_RESPONSE_INVALID"
                 diagnostics[route] = RouteResult(state="failed", error_code=code)
                 warnings.append(f"{route}:{code}")
+    if any(value.error_code == "MODEL_DEADLINE_EXCEEDED" for value in diagnostics.values()):
+        raise DocQAError("MODEL_DEADLINE_EXCEEDED", "Recall exhausted the request time budget")
     if warnings and not allow_degraded:
         raise DocQAError(
             "RETRIEVAL_FAILED", "A required recall route failed: " + ", ".join(warnings)
@@ -136,7 +202,15 @@ def collect_candidates(
         results, generation.chunks, options.route_weights, options.rrf_k
     )
     return CandidatePool(
-        rows[: options.fusion_top_n], scores, ranks, raw, results, diagnostics, warnings, len(rows)
+        rows[: options.fusion_top_n],
+        scores,
+        ranks,
+        raw,
+        results,
+        diagnostics,
+        warnings,
+        len(rows),
+        timings,
     )
 
 
@@ -185,6 +259,7 @@ def query(
         raise DocQAError("INVALID_REQUEST", "allow_degraded must be a boolean")
     permitted = options.allow_degraded if allow_degraded is None else allow_degraded
     with load_generation(generation_directory(index, generation_id)) as generation:
+        validate_recall_selection(generation, options, mode)
         if generation.profiles["mode"] != options.mode:
             raise DocQAError("PROFILE_MISMATCH", "Demo and real model generations cannot be mixed")
         common = dict(
@@ -220,12 +295,13 @@ def query(
                 candidate_count=0,
             )
         services = providers or make_providers(options)
-        if any(service.fingerprint().get("synthetic", False) for service in services):
+        active_services = [service for service in services if service is not None]
+        if any(service.fingerprint().get("synthetic", False) for service in active_services):
             common["synthetic"], common["production_ready"] = True, False
         common["retrieval_profile_id"] = digest(
             {
                 "request_profile": common["retrieval_profile_id"],
-                "services": [service.fingerprint() for service in services],
+                "services": [service.fingerprint() for service in active_services],
             }
         )
         pool = collect_candidates(
@@ -271,6 +347,8 @@ def _finish(generation, question, common, pool, reranker, count, mode, permitted
             pool.routes["reranker"] = RouteResult(state="ok", count=len(values))
         except (DocQAError, OSError, ValueError, TypeError) as exc:
             code = exc.code if isinstance(exc, DocQAError) else "MODEL_RESPONSE_INVALID"
+            if code == "MODEL_DEADLINE_EXCEEDED":
+                raise
             if not permitted:
                 raise DocQAError("RERANK_FAILED", f"Required reranker failed: {code}") from exc
             pool.warnings.append(f"reranker:{code}; explicit RRF fallback")
@@ -303,7 +381,15 @@ def _finish(generation, question, common, pool, reranker, count, mode, permitted
                 final_rank=rank,
             )
         )
+    from docqa.docbase.admission import COVERAGE_WARNING, has_coverage_gaps
+
+    hit_documents = {hit.doc_id for hit in hits}
     warnings = list(pool.warnings)
+    if any(
+        has_coverage_gaps(member) and member["doc_id"] in hit_documents
+        for member in generation.members
+    ):
+        warnings.append(COVERAGE_WARNING)
     if pool.warnings:
         common["production_ready"] = False
     if common["synthetic"]:

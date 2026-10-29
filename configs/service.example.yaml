@@ -1,6 +1,11 @@
-# Copy to configs/local.service.yaml. Relative roots are resolved from this YAML's directory.
-allowed_source_roots: []  # Required for source registration and ingestion; keep narrow.
-types: [pdf, docx, pptx]
+# Copy to local.service.yaml. Relative allowed roots are resolved from this YAML directory.
+allowed_source_roots:
+- ../data/private/documents
+- ../data/private/web-uploads
+types:
+- pdf
+- docx
+- pptx
 settle_seconds: 3
 scan_interval_seconds: 1800
 missing_confirmations: 2
@@ -10,12 +15,86 @@ max_attempts: 3
 retry_base_seconds: 5
 max_jobs_per_tick: 100
 parse:
+  category: auto
+  allowed_roots:
+  - ../data/private/documents
+  - ../data/private/web-uploads
+  max_file_mb: 100
+  max_pages: 1000
+  max_pixels: 20000000
+  render_dpi: 144
+  render_pdf: true
   office_render: auto
+  allow_legacy_office: false
+  office_executable: soffice
   ocr_mode: auto
-  analysis_revision: '1'
+  tesseract_executable: tesseract
+  tessdata_dir: null
+  ocr_languages: chi_sim+eng
+  external_timeout: 120
+  analysis_revision: qwen-vision-v1
   vision:
-    mode: disabled
-# Embed your verified DocBase configuration here for real retrieval models.
+    mode: http
+    endpoint: https://ai.gitee.com/v1/chat/completions
+    model: Qwen3.6-27B
+    revision: gitee-managed-unpinned
+    api_key_env: GITEE_AI_API_KEY
+    enable_thinking: false
+    timeout: 120
+    retries: 1
 retrieval:
   mode: http
+  vector_backend: sqlite_vec
+  incomplete_policy: validated_parts
+  recall_routes:
+  - dense
+  - bm25
+  - sparse
+  chunk:
+    target_utf8_bytes: 2400
+    max_utf8_bytes: 3600
+    overlap_utf8_bytes: 320
+  analyzer_terms:
+  - SD5993
+  - FE_HEART_Start
+  - FE_HEART_Stop
+  - DocBase
+  bm25_k1: 1.2
+  bm25_b: 0.75
+  route_top_n: 50
+  fusion_top_n: 50
+  top_k: 8
+  rrf_k: 60
+  route_weights:
+    dense: 1.0
+    bm25: 1.0
+    sparse: 1.0
   allow_degraded: false
+  dense: &id001
+    protocol: dashscope.text-embedding
+    endpoint: ''
+    endpoint_env: DASHSCOPE_EMBEDDING_ENDPOINT
+    model: qwen3.7-text-embedding-flash
+    revision: aliyun-managed-unpinned
+    tokenizer_revision: aliyun-managed-unreported
+    dimension: 1024
+    vocab_size: 10000000
+    document_prefix: ''
+    query_prefix: ''
+    max_input_utf8_bytes: 8192
+    batch_size: 10
+    api_key_env: DASHSCOPE_API_KEY
+    timeout: 30
+    retries: 1
+  sparse: *id001
+  reranker:
+    protocol: gitee.rerank
+    endpoint: https://ai.gitee.com/v1/rerank
+    model: Qwen3-Reranker-8B
+    revision: gitee-managed-unpinned
+    tokenizer_revision: gitee-managed-unreported
+    max_input_utf8_bytes: 8192
+    batch_size: 16
+    api_key_env: GITEE_AI_API_KEY
+    timeout: 60
+    retries: 2

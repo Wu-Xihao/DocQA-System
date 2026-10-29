@@ -1,0 +1,22 @@
+# Isolated synthetic workspace only: no real model calls or semantic verification.
+host: 127.0.0.1
+port: 8765
+index: ../runtime/workspace-demo-service/index
+state: ../runtime/workspace-demo-web
+service_state: ../runtime/workspace-demo-service
+service_config: service.demo.example.yaml
+upload_root: ../runtime/workspace-demo-uploads
+service_mode: auto
+agent:
+  mode: demo
+  retrieval:
+    mode: demo
+    recall_routes:
+    - dense
+    - bm25
+    incomplete_policy: native_only
+    allow_degraded: false
+    route_weights:
+      dense: 1.0
+      bm25: 1.0
+    vector_backend: sqlite_vec

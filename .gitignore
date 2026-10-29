@@ -19,6 +19,11 @@ __pycache__/
 !.env.*.example
 
 # Machine-specific configuration; templates remain versioned
+/configs/*
+!/configs/*.example.yaml
+!/configs/*.example.yml
+!/configs/.env.example
+!/configs/.env.*.example
 /configs/local.yaml
 /configs/local.yml
 /configs/local.*.yaml
@@ -30,6 +35,9 @@ __pycache__/
 /runtime/
 /data/private/
 /.design-work/
+/.local-archive/
+/Document/*
+!/Document/系统设计说明.md
 /eval/reports/raw/
 
 # Machine-specific environment snapshots (real project lock files stay tracked)

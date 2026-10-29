@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import Field, field_validator
+from typing import Literal
+
+from pydantic import Field, field_validator, model_validator
 
 from docqa.domain.answers import OutputFormat
 from docqa.domain.documents import Contract
@@ -11,9 +13,19 @@ from docqa.domain.documents import Contract
 class QuestionRequest(Contract):
     question: str = Field(min_length=1, max_length=4000)
     categories: list[str] | None = Field(default=None, max_length=100)
-    doc_ids: list[str] | None = Field(default=None, max_length=100)
+    doc_ids: list[str] | None = Field(default=None, max_length=1000)
     topics: list[str] | None = Field(default=None, min_length=1, max_length=12)
     output_format: OutputFormat = "markdown"
+    doc_types: list[Literal["pdf", "docx", "pptx"]] | None = Field(
+        default=None, min_length=1, max_length=3
+    )
+
+    @field_validator("doc_types")
+    @classmethod
+    def unique_types(cls, value):
+        if value is not None and len(value) != len(set(value)):
+            raise ValueError("Document types must be distinct")
+        return value
 
     @field_validator("question")
     @classmethod
@@ -36,3 +48,51 @@ class QuestionRequest(Contract):
         if info.field_name == "topics" and values is not None and len(values) != len(set(values)):
             raise ValueError("Required topics must be distinct")
         return values
+
+
+class MessageRequest(QuestionRequest):
+    client_request_id: str = Field(pattern=r"^[a-zA-Z0-9_-]{16,80}$")
+    scope_mode: Literal["all", "selected"] = "all"
+
+    @model_validator(mode="after")
+    def explicit_scope(self):
+        if self.scope_mode == "selected" and not self.doc_ids:
+            raise ValueError("Selected scope cannot be empty")
+        if self.doc_ids is not None and not self.doc_ids:
+            raise ValueError("Empty document selection never means all")
+        return self
+
+
+class ConversationCreate(Contract):
+    title: str = Field(default="新对话", min_length=1, max_length=100)
+
+
+class ConversationPatch(Contract):
+    title: str | None = Field(default=None, min_length=1, max_length=100)
+    pinned: bool | None = None
+    archived: bool | None = None
+    version: int | None = Field(default=None, ge=1)
+
+
+class UploadCreate(Contract):
+    relative_path: str | None = Field(default=None, max_length=2048)
+
+    @field_validator("relative_path")
+    @classmethod
+    def safe_relative_path(cls, value):
+        if value is not None:
+            parts = value.split("/")
+            if any(p in {"", ".", ".."} for p in parts) or any(c in value for c in "\\:\x00\r\n"):
+                raise ValueError("Folder path must be a relative browser path")
+        return value
+
+    name: str = Field(min_length=1, max_length=255)
+    size: int = Field(gt=0, le=1024 * 1024 * 1024)
+    category: str = Field(default="auto", min_length=1, max_length=100)
+
+
+class ArtifactCreate(Contract):
+    conversation_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    answer_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    kind: Literal["table", "relation", "mindmap", "report", "slides"]
+    title: str | None = Field(default=None, min_length=1, max_length=100)

@@ -21,11 +21,13 @@ class ChatServiceOptions(Contract):
     model: str = ""
     revision: str = ""
     api_key_env: str | None = None
+    thinking: Literal["enabled", "disabled"] | None = None
     timeout: float = Field(default=30, gt=0, le=600, allow_inf_nan=False)
     retries: int = Field(default=2, ge=0, le=3)
     max_input_utf8_bytes: int = Field(default=131072, ge=1024, le=16_777_216)
     max_response_bytes: int = Field(default=131072, ge=128, le=16_777_216)
     max_output_tokens: int = Field(default=4096, ge=128, le=32768)
+    compact_evidence: bool = False
 
     @field_validator("api_key_env")
     @classmethod
@@ -46,18 +48,23 @@ class AgentOptions(Contract):
     max_candidates: int = Field(default=100, ge=1, le=10000)
     rerank_top_n: int = Field(default=50, ge=1, le=10000)
     max_evidence_bytes: int = Field(default=24000, ge=1000, le=4_194_304)
+    initial_evidence_fraction: float = Field(default=1, gt=0, le=1, allow_inf_nan=False)
     max_output_bytes: int = Field(default=12000, ge=256, le=1_048_576)
     deadline_seconds: float = Field(default=120, gt=0, le=3600, allow_inf_nan=False)
+    finalization_reserve_seconds: float = Field(default=0, ge=0, le=600, allow_inf_nan=False)
     session_ttl_seconds: int = Field(default=3600, ge=30, le=604800)
     max_session_queries: int = Field(default=6, ge=1, le=100)
     max_model_calls: int = Field(default=12, ge=1, le=100)
     max_finalize_attempts: int = Field(default=2, ge=2, le=2)
     allow_degraded: bool = False
+    combine_assessment_and_compose: bool = False
 
     @model_validator(mode="after")
     def validate_budgets(self):
         if self.rerank_top_n > self.max_candidates:
             raise ValueError("rerank_top_n exceeds max_candidates")
+        if self.finalization_reserve_seconds >= self.deadline_seconds:
+            raise ValueError("Finalization reserve must be shorter than the answer deadline")
         return self
 
 

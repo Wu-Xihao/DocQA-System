@@ -12,9 +12,11 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -129,6 +131,7 @@ class TesseractOCR:
         languages: str = "chi_sim+eng",
         timeout: float = 60,
         max_output_bytes: int = 2 * 1024 * 1024,
+        tessdata_dir: str | Path | None = None,
     ):
         if not executable or timeout <= 0 or max_output_bytes <= 0:
             raise ValueError("OCR executable, timeout and output limit must be valid")
@@ -138,10 +141,11 @@ class TesseractOCR:
         self.languages = languages
         self.timeout = timeout
         self.max_output_bytes = max_output_bytes
+        self.tessdata_dir = None if tessdata_dir is None else str(tessdata_dir)
         self._languages_checked = False
 
     def fingerprint(self) -> dict:
-        return {
+        value = {
             "adapter": "tesseract",
             "adapter_revision": "1",
             "executable": self.executable,
@@ -150,12 +154,18 @@ class TesseractOCR:
             "max_output_bytes": self.max_output_bytes,
             "psm": 3,
         }
+        if self.tessdata_dir is not None:
+            value["tessdata_dir"] = self.tessdata_dir
+        return value
+
+    def _data_arguments(self):
+        return [] if self.tessdata_dir is None else ["--tessdata-dir", self.tessdata_dir]
 
     def _check_languages(self) -> None:
         if self._languages_checked:
             return
         code, stdout, stderr = _run_tool(
-            [self.executable, "--list-langs"],
+            [self.executable, *self._data_arguments(), "--list-langs"],
             timeout=self.timeout,
             max_output_bytes=self.max_output_bytes,
             code_prefix="OCR",
@@ -175,7 +185,16 @@ class TesseractOCR:
             raise DocQAError("OCR_IMAGE_NOT_FOUND", "OCR input image was not found")
         self._check_languages()
         code, stdout, _ = _run_tool(
-            [self.executable, str(image), "stdout", "-l", self.languages, "--psm", "3"],
+            [
+                self.executable,
+                str(image),
+                "stdout",
+                *self._data_arguments(),
+                "-l",
+                self.languages,
+                "--psm",
+                "3",
+            ],
             timeout=self.timeout,
             max_output_bytes=self.max_output_bytes,
             code_prefix="OCR",
@@ -183,6 +202,31 @@ class TesseractOCR:
         if code:
             raise DocQAError("OCR_FAILED", "OCR tool returned an unsuccessful exit status")
         return stdout.decode("utf-8", errors="replace").strip()
+
+
+@contextmanager
+def _office_workspace(output_dir: Path):
+    """Remove only our fresh workspace, including Windows paths beyond MAX_PATH.
+
+    LibreOffice creates deeply nested extension registries even for a one-page
+    file. Use extended paths for cleanup, while keeping ordinary file URIs for
+    the converter. A successful export must not fail during profile removal.
+    """
+    root = output_dir.resolve()
+    temporary = Path(tempfile.mkdtemp(prefix=".office-", dir=root)).resolve()
+    if temporary.parent != root or temporary.is_symlink():
+        raise DocQAError("OFFICE_WORKSPACE_INVALID", "Office workspace is outside its output root")
+    try:
+        yield temporary
+    finally:
+        if temporary.is_symlink() or temporary.resolve() != temporary or temporary.parent != root:
+            raise DocQAError(
+                "OFFICE_WORKSPACE_INVALID", "Office workspace changed during conversion"
+            )
+        path = str(temporary)
+        if os.name == "nt" and not path.startswith("\\\\?\\"):
+            path = "\\\\?\\UNC\\" + path[2:] if path.startswith("\\\\") else "\\\\?\\" + path
+        shutil.rmtree(path)
 
 
 class LibreOfficeRenderer:
@@ -227,8 +271,7 @@ class LibreOfficeRenderer:
             raise DocQAError("OFFICE_FORMAT_UNSUPPORTED", "Office PDF export format is unsupported")
         output_dir = Path(output_dir).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".office-", dir=output_dir) as temporary:
-            temporary = Path(temporary)
+        with _office_workspace(output_dir) as temporary:
             profile = temporary / "profile"
             export = temporary / "export"
             (profile / "user").mkdir(parents=True)
@@ -303,6 +346,8 @@ class HttpVisionClient:
         max_response_bytes: int = 2 * 1024 * 1024,
         transport: httpx.BaseTransport | None = None,
         max_image_bytes: int = 20 * 1024 * 1024,
+        thinking: str | None = None,
+        enable_thinking: bool | None = None,
     ):
         try:
             parsed = urlsplit(endpoint)
@@ -329,11 +374,19 @@ class HttpVisionClient:
         self.retries = retries
         self.max_response_bytes = max_response_bytes
         self.max_image_bytes = max_image_bytes
+        if thinking not in (None, "enabled", "disabled"):
+            raise ValueError("Vision thinking mode must be enabled, disabled or unset")
+        self.thinking = thinking
+        if enable_thinking is not None and type(enable_thinking) is not bool:
+            raise ValueError("enable_thinking must be a boolean")
+        if thinking is not None and enable_thinking is not None:
+            raise ValueError("Choose one provider thinking protocol")
+        self.enable_thinking = enable_thinking
         self.transport = transport
 
     def fingerprint(self) -> dict:
         # Paths can also carry sensitive tokens; only a digest is persisted.
-        return {
+        value = {
             "adapter": "http_chat_vision",
             "adapter_revision": "1",
             "endpoint_sha256": sha256(self.endpoint.encode("utf-8")).hexdigest(),
@@ -345,6 +398,11 @@ class HttpVisionClient:
             "max_response_bytes": self.max_response_bytes,
             "max_image_bytes": self.max_image_bytes,
         }
+        if self.thinking is not None:
+            value["thinking"] = self.thinking
+        if self.enable_thinking is not None:
+            value["enable_thinking"] = self.enable_thinking
+        return value
 
     def _image_url(self, image: Path) -> str:
         try:
@@ -485,6 +543,10 @@ class HttpVisionClient:
                     "max_tokens": 4096,
                     "response_format": {"type": "json_object"},
                 }
+                if self.thinking is not None:
+                    body["thinking"] = {"type": self.thinking}
+                if self.enable_thinking is not None:
+                    body["enable_thinking"] = self.enable_thinking
                 content = self._request(client, body, headers).strip()
                 fence = re.fullmatch(
                     r"```(?:json)?\s*(.*?)\s*```", content, re.DOTALL | re.IGNORECASE

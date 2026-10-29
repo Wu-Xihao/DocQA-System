@@ -13,7 +13,8 @@ import os
 import re
 import shutil
 import sqlite3
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -21,6 +22,9 @@ from typing import Any
 import numpy as np
 
 from docqa.domain.errors import DocQAError
+from docqa.integrity import VerifiedCache, tree_stamp
+
+_VERIFIED_GENERATIONS = VerifiedCache()
 
 SCHEMA = "docqa.generation.v1"
 REQUIRED_FILES = {
@@ -84,6 +88,28 @@ def _read_json(path: Path, *, maximum: int = 256 * 1024 * 1024) -> Any:
     if path.stat().st_size > maximum:
         raise ValueError("JSON metadata exceeds the supported size")
     return json.loads(path.read_bytes())
+
+
+def install_generation(root: Path, staging: Path, generation_id: str) -> Path:
+    """Atomically install a checked candidate; tolerate brief Windows file locks."""
+    root, staging = _io_path(Path(root).resolve()), _io_path(Path(staging).resolve())
+    if (
+        not _IDENTIFIER.fullmatch(generation_id)
+        or staging.parent != root / "staging"
+        or staging.is_symlink()
+        or staging.is_junction()
+    ):
+        raise DocQAError("INVALID_GENERATION", "Candidate is outside managed staging")
+    target = _safe_path(root, "generations/" + generation_id)
+    if target.exists():
+        raise DocQAError("INVALID_GENERATION", "Generation target already exists")
+    for attempt in range(7):
+        try:
+            return staging.replace(target)
+        except PermissionError:
+            if os.name != "nt" or attempt == 6:
+                raise
+            time.sleep(0.02 * 2**attempt)
 
 
 def _safe_path(directory: Path, relative: str) -> Path:
@@ -260,6 +286,29 @@ def copy_source_package(source: Path, destination: Path) -> str:
     return target.relative_to(destination).as_posix()
 
 
+def generation_recall_routes(profiles: dict) -> tuple[str, ...]:
+    """Read declared capabilities, preserving generations written before routes existed."""
+    routes = profiles.get("recall_routes", ["dense", "bm25", "sparse"])
+    if routes not in (["dense", "bm25"], ["dense", "bm25", "sparse"]):
+        raise ValueError("Invalid generation recall capabilities")
+    sparse_profile = profiles.get("sparse", {})
+    if not isinstance(sparse_profile, dict):
+        raise ValueError("Sparse profile must be an object")
+    if "sparse" not in routes:
+        if sparse_profile != {"enabled": False}:
+            raise ValueError("Disabled sparse route must carry an explicit disabled profile")
+    elif sparse_profile.get("enabled") is False:
+        raise ValueError("Enabled sparse route cannot carry a disabled profile")
+    return tuple(routes)
+
+
+def _validate_recall_postings(profiles: dict, sparse: dict) -> None:
+    if "sparse" not in generation_recall_routes(profiles) and (
+        sparse["postings"] or any(sparse["nonzero_counts"])
+    ):
+        raise ValueError("Disabled sparse route cannot contain learned postings")
+
+
 def write_generation(
     staging: Path,
     *,
@@ -294,11 +343,16 @@ def write_generation(
             vectors = np.empty((0, dimension), dtype=np.float32)
         _validate_vectors(vectors, len(chunks))
         _validate_postings(bm25, sparse, len(chunks))
+        _validate_recall_postings(profiles, sparse)
         _catalog(staging, chunks, members)
         _write_json(staging / "profiles.json", profiles)
         _write_json(staging / "members.json", members)
         (staging / "dense").mkdir(exist_ok=True)
         np.save(staging / "dense/vectors.npy", vectors, allow_pickle=False)
+        if profiles.get("vector_backend", "numpy") == "sqlite_vec":
+            from docqa.docbase.vector_db import create
+
+            create(staging / "dense/vectors.sqlite", vectors)
         (staging / "dense/row_ids.jsonl").write_bytes(
             b"".join(
                 _json_bytes({"row_id": row, "chunk_id": chunk.chunk_id}) + b"\n"
@@ -332,7 +386,14 @@ def write_generation(
             "dense": {"dtype": "float32", "shape": list(vectors.shape), "order": "C"},
             "files": files,
         }
-        manifest["production_ready"] = not manifest["synthetic"]
+        from docqa.docbase.admission import has_coverage_gaps
+
+        partial_count = sum(has_coverage_gaps(member) for member in members)
+        if partial_count:
+            manifest["partial_source_count"] = partial_count
+        manifest["production_ready"] = not manifest["synthetic"] and not partial_count
+        if "recall_routes" in profiles:
+            manifest["recall_routes"] = list(generation_recall_routes(profiles))
         _write_json(staging / "manifest.json", manifest)
         verify_generation(staging)
         for path in staging.rglob("*"):
@@ -373,6 +434,7 @@ class Generation:
 
 def _verify_sources(directory: Path, chunks: list, members: list[dict], profiles: dict) -> None:
     from docqa.doc2md.pipeline import verify_artifact
+    from docqa.docbase.admission import index_projection, source_admission
     from docqa.docbase.chunker import chunk_artifact, resolve_span_text
     from docqa.domain.documents import DocumentIR
     from docqa.domain.rag import ChunkOptions
@@ -389,9 +451,13 @@ def _verify_sources(directory: Path, chunks: list, members: list[dict], profiles
         if member.get("artifact_ref", expected) != expected:
             raise ValueError("Member artifact path is not canonical")
         artifact = _safe_path(directory, expected)
-        if verify_artifact(artifact)["status"] != "complete":
-            raise ValueError("Incomplete doc2md sources cannot enter an index")
+        verification = verify_artifact(artifact)
         ir = DocumentIR.model_validate_json((artifact / "document.ir.json").read_bytes())
+        quality = source_admission(
+            ir, verification["status"], profiles.get("incomplete_policy", "reject")
+        )
+        if member.get("source_quality") != quality:
+            raise ValueError("Member quality differs from verified source admission")
         if (ir.doc_id, ir.revision_id, ir.artifact_id) != (
             member["doc_id"],
             member["revision_id"],
@@ -442,15 +508,63 @@ def _verify_sources(directory: Path, chunks: list, members: list[dict], profiles
     if artifacts:
         options = ChunkOptions.model_validate(profiles["chunk"]["options"])
         projected = []
-        for ir, source_map, _, _ in artifacts.values():
-            projected.extend(chunk_artifact(ir, source_map, options))
+        for ir, source_map, _, member in artifacts.values():
+            projected.extend(chunk_artifact(index_projection(ir, member), source_map, options))
         expected = {chunk.chunk_id: chunk.model_dump(mode="json") for chunk in projected}
         actual = {chunk.chunk_id: chunk.model_dump(mode="json") for chunk in chunks}
         if actual != expected:
             raise ValueError("Chunk catalog differs from the deterministic source projection")
 
 
-def load_generation(directory: Path, *, verify_sources: bool = True) -> Generation:
+def load_generation(
+    directory: Path, *, verify_sources: bool = True, use_cache: bool = True
+) -> Generation:
+    """Reuse immutable parsed data only while every file's change identity matches.
+
+    Every caller owns its mmap and receives independent mutable metadata. Explicit
+    verify operations bypass this cache; a cache failure never yields stale data.
+    """
+    directory = _io_path(Path(directory).resolve())
+    if not use_cache or directory.parent.name != "generations":
+        return _load_generation(directory, verify_sources=verify_sources)
+    key = (str(directory), verify_sources)
+    with _VERIFIED_GENERATIONS.guard(key):
+        before = tree_stamp(directory)
+        cached = _VERIFIED_GENERATIONS.get(key, before)
+        if cached is not None:
+            try:
+                cached.vectors = np.load(
+                    directory / "dense/vectors.npy", mmap_mode="r", allow_pickle=False
+                )
+                if tree_stamp(directory) == before:
+                    return cached
+            except (OSError, ValueError):
+                pass  # Changed/unreadable files must go through the full error path.
+            cached.close()
+            _VERIFIED_GENERATIONS.clear()
+        generation = _load_generation(directory, verify_sources=verify_sources)
+        after = tree_stamp(directory)
+        if before is not None and after != before:
+            generation.close()
+            raise DocQAError("GENERATION_CORRUPT", "Generation changed during validation")
+        size = (
+            sum(
+                (directory / name).stat().st_size
+                for name in (
+                    "catalog.sqlite",
+                    "members.json",
+                    "profiles.json",
+                    "bm25/index.json",
+                    "sparse/index.json",
+                )
+            )
+            * 4
+        )
+        _VERIFIED_GENERATIONS.put(key, after, replace(generation, vectors=None), size)
+        return generation
+
+
+def _load_generation(directory: Path, *, verify_sources: bool = True) -> Generation:
     """Load only after all manifest, row, model, posting and source gates succeed."""
     from docqa.domain.rag import Chunk, chunk_identity
 
@@ -516,12 +630,20 @@ def load_generation(directory: Path, *, verify_sources: bool = True) -> Generati
         profiles = _read_json(directory / "profiles.json")
         if _digest(profiles) != manifest["profiles_sha256"]:
             raise ValueError("Profile identity differs")
+        routes = generation_recall_routes(profiles)
+        if "recall_routes" in manifest and tuple(manifest["recall_routes"]) != routes:
+            raise ValueError("Manifest recall capabilities differ from profiles")
         synthetic = profiles.get("mode") == "demo" or any(
             profiles.get(provider, {}).get("synthetic", False)
             for provider in ("dense", "sparse", "reranker")
         )
+        from docqa.docbase.admission import has_coverage_gaps
+
+        partial_count = sum(has_coverage_gaps(member) for member in stored_members)
+        if manifest.get("partial_source_count", 0) != partial_count:
+            raise ValueError("Partial source count differs from member snapshot")
         if manifest.get("synthetic") is not synthetic or manifest.get("production_ready") is not (
-            not synthetic
+            not synthetic and not partial_count
         ):
             raise ValueError("Generation capability labels differ from provider profiles")
         members = _read_json(directory / "members.json")
@@ -542,6 +664,7 @@ def load_generation(directory: Path, *, verify_sources: bool = True) -> Generati
         bm25 = _read_json(directory / "bm25/index.json")
         sparse = _read_json(directory / "sparse/index.json")
         _validate_postings(bm25, sparse, count)
+        _validate_recall_postings(profiles, sparse)
         if not vectors.flags.c_contiguous:
             raise ValueError("Dense array must use declared C row order")
         vocabulary_size = profiles.get("sparse", {}).get("vocab_size")
@@ -572,6 +695,15 @@ def load_generation(directory: Path, *, verify_sources: bool = True) -> Generati
                 raise ValueError("BM25 scoring profile differs from its index")
         if verify_sources:
             _verify_sources(directory, chunks, members, profiles)
+        backend = profiles.get("vector_backend", "numpy")
+        if backend not in {"numpy", "sqlite_vec"}:
+            raise ValueError("Unknown vector database backend")
+        if backend == "sqlite_vec":
+            from docqa.docbase.vector_db import verify
+
+            if "dense/vectors.sqlite" not in manifest["files"]:
+                raise ValueError("Vector database is not bound to manifest")
+            verify(directory / "dense/vectors.sqlite", vectors)
         return Generation(directory, chunks, vectors, bm25, sparse, members, profiles, manifest)
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, DocQAError) as exc:
         if vectors is not None:
@@ -584,7 +716,7 @@ def load_generation(directory: Path, *, verify_sources: bool = True) -> Generati
 
 
 def verify_generation(directory: Path, *, verify_sources: bool = True) -> dict:
-    with load_generation(directory, verify_sources=verify_sources) as generation:
+    with load_generation(directory, verify_sources=verify_sources, use_cache=False) as generation:
         return {
             "valid": True,
             "generation_id": generation.manifest["generation_id"],
@@ -644,7 +776,12 @@ def _registry(root: Path) -> sqlite3.Connection:
 
 def read_current(root: Path) -> tuple[str | None, int]:
     try:
-        connection = _registry(Path(root))
+        registry = Path(root).resolve() / "registry.sqlite"
+        connection = (
+            sqlite3.connect(registry.as_uri() + "?mode=ro", uri=True, timeout=20)
+            if registry.is_file()
+            else _registry(Path(root))
+        )
         try:
             row = connection.execute(
                 "SELECT generation_id,publish_sequence FROM publication WHERE id=1"
