@@ -4,7 +4,6 @@
 
 - [系统设计说明](Document/系统设计说明.md)：当前架构、数据流、存储、校验和实现边界。
 - [知识消费约定](AGENTS.md)：先检索、按证据回答、强制引用与原图核对。
-- 配置只提交 `configs/*.example.yaml` 和 `configs/.env.example`；资料、密钥和运行数据不入库。
 
 ## 1. 安装环境
 
@@ -19,7 +18,7 @@ python scripts/check_environment.py
 python -m pip check
 ```
 
-`requirements.txt` 是唯一完整的应用与测试依赖清单，`pyproject.toml` 从中读取依赖。完整图片解析另需 **Tesseract（chi_sim、eng 语言数据）与 LibreOffice**，加入 PATH，或在 YAML 填可执行文件的绝对路径；它们不是 pip 包。
+`requirements.txt` 完整的应用与测试依赖清单，`pyproject.toml` 从中读取依赖。完整图片解析另需 **Tesseract（chi_sim、eng 语言数据）与 LibreOffice**，加入 PATH，或在 YAML 填可执行文件的绝对路径；它们不是 pip 包。
 
 ## 2. 离线演示
 
@@ -107,7 +106,9 @@ python -m dotenv -f configs/.env run -- python scripts/docqa.py service run --on
 
 `queued/running` 都不是完成，按返回 job ID 查询，直到 `succeeded`。一次 `run --once` 不保证整个队列清空，未完成则继续运行 Service。索引与配置不一致时同步三处检索配置、完成重建，再重启 Web；历史对话固定旧索引，请升级资料版本或新建对话。
 
-网页无响应先检查终端并 **Ctrl+F5**；`documents=0` 查看文档状态和解析质量；`CITATION_INVALID` 表示草稿引用未通过校验，不应关闭校验。完整解析缺工具或 VL 时补齐后重新解析，详见[设计说明](Document/系统设计说明.md)。
+网页无响应先检查终端并 **Ctrl+F5**；
+
+详见[设计说明](Document/系统设计说明.md)。
 
 ## 6. 开发与数据
 
@@ -120,4 +121,4 @@ Windows 测试使用短临时路径，避免超过路径长度限制。`tests/br
 
 后台 Markdown 位于 `runtime/service-user/parsed/artifacts/<artifact_id>/document.md`，原始快照、图片、映射和质量报告一同保留。`runtime`、`data/private`、`.env`、本机配置和 `.local-archive` 不提交。旧文档只在当前版本移除，Git 历史未重写。
 
-历史兼容的独立本地 BGE-M3 编码服务不属于当前百炼部署；按需 `pip install -e ".[legacy-sparse]"` 安装额外依赖，无须另一份 requirements 文件。
+
