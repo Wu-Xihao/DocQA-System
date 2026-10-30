@@ -201,6 +201,7 @@ def test_reader_lists_uncited_document_images_and_safe_previews(formats, tmp_pat
         second = client.get(base + "?offset=1").json()
         assert second["items"][0]["id"] != first["items"][0]["id"]
         image = first["items"][0]
+        assert image["vision"] is None  # No fabricated description for unanalysed images.
         response = client.get(image["thumbnail"])
         assert response.status_code == 200 and response.headers["content-type"] == "image/png"
         with Image.open(io.BytesIO(response.content)) as picture:

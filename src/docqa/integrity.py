@@ -3,14 +3,23 @@
 No verification decisions are persisted. Windows uses FILE_BASIC_INFO.ChangeTime,
 not st_ctime (creation time), so restoring LastWriteTime cannot hide a write.
 If reliable change metadata cannot be read, callers must do full validation.
+
+Change times are only as fine as the filesystem clock tick, so a same-size
+rewrite in the same tick keeps every metadata field. Like Git's "racily clean"
+rule, a stamp whose change time is within RACY_SECONDS of now also carries a
+content digest, and such stamps are never cached. Digests are compared only when
+both stamps have one, so a file settling between two reads is not a "change".
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
+import pickle
 import stat
 import threading
+import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
@@ -46,6 +55,55 @@ if os.name == "nt":
     _close.restype = wintypes.BOOL
 
 
+RACY_SECONDS = 2
+_FILETIME_EPOCH = 116444736000000000  # 1601-01-01 to 1970-01-01, in 100 ns units
+
+
+def _racy(change: int) -> bool:
+    """Whether a change time (FILETIME on Windows, ns elsewhere) is too recent to trust."""
+    if os.name == "nt":
+        now = time.time_ns() // 100 + _FILETIME_EPOCH
+        return now - change < RACY_SECONDS * 10_000_000
+    return time.time_ns() - change < RACY_SECONDS * 1_000_000_000
+
+
+def _digest(path: Path) -> str:
+    value = hashlib.blake2b(digest_size=16)
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+class Stamp(tuple):
+    """Metadata tuple plus digests (keyed by relative path) of racily recent files."""
+
+    def __new__(cls, meta, digests=None):
+        value = super().__new__(cls, meta)
+        value.digests = digests or {}
+        return value
+
+    def __eq__(self, other):
+        if not isinstance(other, tuple):
+            return NotImplemented
+        if tuple(self) != tuple(other):
+            return False
+        theirs = getattr(other, "digests", {})
+        return all(theirs[k] == v for k, v in self.digests.items() if k in theirs)
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        return result if result is NotImplemented else not result
+
+    __hash__ = tuple.__hash__
+
+
+def is_racy(stamp) -> bool:
+    if isinstance(stamp, Stamp) and stamp.digests:
+        return True
+    return isinstance(stamp, tuple) and any(is_racy(item) for item in stamp)
+
+
 def file_stamp(path: Path) -> tuple:
     value = path.stat(follow_symlinks=False)
     if not stat.S_ISREG(value.st_mode) or getattr(value, "st_file_attributes", 0) & 0x400:
@@ -68,12 +126,29 @@ def file_stamp(path: Path) -> tuple:
             change = data.ChangeTime
         finally:
             _close(handle)
-    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, change)
+    meta = (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, change)
+    return Stamp(meta, {"": _digest(path)} if _racy(change) else None)
 
 
 def tree_stamp(directory: Path) -> tuple | None:
     """Detect changed bytes' metadata, rename/replacement and added/deleted files."""
     try:
+        if os.name == "nt":
+            from docqa.windows_identity import directory_tree_stamp
+
+            result = directory_tree_stamp(
+                directory, open_file=_open, get_info=_info, close_handle=_close
+            )
+            if result is None:
+                return None
+            return Stamp(
+                result,
+                {
+                    name: _digest(directory / name)
+                    for name, info in result
+                    if not name.endswith("/") and _racy(info[3])
+                },
+            )
         values = []
 
         def visit(folder, prefix=""):
@@ -96,9 +171,35 @@ def tree_stamp(directory: Path) -> tuple | None:
         return None
 
 
+def subtree_stamp(stamp, prefix: str):
+    """Re-root the entries of a tree stamp under ``prefix`` (e.g. "dense/").
+
+    Comparing this with ``tree_stamp(directory / prefix)`` re-checks only that
+    subtree, for callers that already validated the whole tree once.
+    """
+    if stamp is None:
+        return None
+    meta = tuple(
+        (name[len(prefix) :], info)
+        for name, info in stamp
+        if name.startswith(prefix) and name != prefix
+    )
+    digests = {
+        name[len(prefix) :]: value
+        for name, value in getattr(stamp, "digests", {}).items()
+        if name.startswith(prefix)
+    }
+    return Stamp(meta, digests) if meta else None
+
+
 class VerifiedCache:
-    def __init__(self, *, max_entries=4, max_bytes=64 * 1024 * 1024):
+    def __init__(self, *, max_entries=4, max_bytes=64 * 1024 * 1024, serialized=False):
         self.max_entries, self.max_bytes = max_entries, max_bytes
+        # Only trusted, already validated Python values enter this process-local
+        # cache. These buffers are NEVER persisted or read from external input.
+        # C serialization avoids walking huge sparse postings with deepcopy on
+        # every phase and accounts for the actual retained buffer size.
+        self.serialized = serialized
         self.entries = OrderedDict()
         self.lock = threading.RLock()
         self.flights = {}
@@ -120,13 +221,17 @@ class VerifiedCache:
                 self.entries.pop(key, None)
                 return None
             self.entries.move_to_end(key)
-            return copy.deepcopy(entry[1])
+            return pickle.loads(entry[1]) if self.serialized else copy.deepcopy(entry[1])
 
     def put(self, key, stamp, value, size):
-        if stamp is None or size > self.max_bytes:
+        if stamp is None or is_racy(stamp) or (not self.serialized and size > self.max_bytes):
+            return
+        packed = pickle.dumps(value, protocol=5) if self.serialized else copy.deepcopy(value)
+        size = len(packed) if self.serialized else size
+        if size > self.max_bytes:
             return
         with self.lock:
-            self.entries[key] = (stamp, copy.deepcopy(value), size)
+            self.entries[key] = (stamp, packed, size)
             self.entries.move_to_end(key)
             while (
                 len(self.entries) > self.max_entries

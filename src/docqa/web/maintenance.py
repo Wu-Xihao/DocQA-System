@@ -1,19 +1,28 @@
 """Bounded same-origin controls for server-local directory monitoring."""
 
 import time
-from typing import Literal
 
 from fastapi import Request
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from docqa.domain.documents import Contract
+from docqa.domain.formats import UPLOAD_FORMATS
 
 
 class WatchCreate(Contract):
     path: str = Field(min_length=1, max_length=4096)
-    types: list[Literal["docx", "pptx", "pdf"]] = Field(
-        default_factory=lambda: ["docx", "pptx", "pdf"], min_length=1, max_length=3
+    types: list[str] = Field(
+        default_factory=lambda: list(UPLOAD_FORMATS),
+        min_length=1,
+        max_length=len(UPLOAD_FORMATS),
     )
+
+    @field_validator("types")
+    @classmethod
+    def known_types(cls, value):
+        if len(value) != len(set(value)) or not set(value) <= set(UPLOAD_FORMATS):
+            raise ValueError("Unknown or repeated document type")
+        return value
     recursive: bool = True
     interval_seconds: float = Field(default=1800, ge=15, le=604800)
     category: str = Field(default="auto", min_length=1, max_length=100)

@@ -117,6 +117,8 @@ def original_content(artifact, *, offset=0, limit=200, max_bytes=33554432, focus
                 "text": b.text,
                 "table_rows": b.table_rows,
                 "heading_level": b.heading_level,
+                "table_series": b.metadata.get("table_series"),
+                "continuation_previous": b.metadata.get("continuation_previous"),
                 "location": "；".join(loc.display_label for loc in b.locators),
             }
             for b in selected
@@ -131,11 +133,12 @@ def original_content(artifact, *, offset=0, limit=200, max_bytes=33554432, focus
 def document_images(artifact, base_url, *, offset=0, limit=24, query="", max_bytes=33554432):
     """All extracted occurrences, not just images cited in the current answer."""
     ir = _image_ir(artifact, max_bytes)
-    figures = ir.figures[offset : offset + limit]
+    visible = [f for f in ir.figures if not f.full_page and not f.metadata.get("exclude_gallery")]
+    figures = visible[offset : offset + limit]
     separator = "&" if query else "?"
     return {
         "source_name": ir.source_name,
-        "total": len(ir.figures),
+        "total": len(visible),
         "items": [
             {
                 "id": f.figure_id,
@@ -143,6 +146,7 @@ def document_images(artifact, base_url, *, offset=0, limit=24, query="", max_byt
                 "location": f.locator.display_label,
                 "state": f.semantic_state,
                 "analysis_required": f.analysis_required,
+                "vision": f.vision.model_dump(mode="json") if f.vision else None,
                 "full_page": f.full_page,
                 "thumbnail": base_url
                 + "/"
@@ -161,8 +165,8 @@ def document_images(artifact, base_url, *, offset=0, limit=24, query="", max_byt
             }
             for i, f in enumerate(figures)
         ],
-        "next_offset": offset + len(figures) if offset + len(figures) < len(ir.figures) else None,
-        "notice": "展示该版本文档已提取的全部图片（含页面渲染及归档图）；图片可查看不等于已获准作为回答证据。未提取内容请核对原文件。",
+        "next_offset": offset + len(figures) if offset + len(figures) < len(visible) else None,
+        "notice": "展示已提取的图表与图片区域；整页扫描正文及被渲染区域替代的归档图不列为图表。图片可查看不等于已获准作为回答证据；完整页面请查看原文件。",
     }
 
 

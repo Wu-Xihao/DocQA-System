@@ -2,12 +2,12 @@ import {
   el,
   button,
   richText,
-  sourceWarning,
   errorText,
   statusNames,
   locationText,
 } from "./dom.js";
 import { icon } from "./icons.js";
+import { renderWordcloud } from "./wordcloud.js";
 
 export const artifactTypes = {
   table: { label: "结构化表格", symbol: "▦", hint: "整理有据内容" },
@@ -15,6 +15,7 @@ export const artifactTypes = {
   mindmap: { label: "思维导图", symbol: "❋", hint: "梳理主题脉络" },
   report: { label: "研究文档", symbol: "▤", hint: "形成可读报告" },
   slides: { label: "演示文稿", symbol: "▰", hint: "把要点带上台" },
+  wordcloud: { label: "词云", symbol: "☁", hint: "发现内容关键词" },
 };
 
 export function refs(ids, select) {
@@ -35,14 +36,6 @@ export function answerContent(answer, select) {
   if (answer.synthetic)
     root.append(
       el("p", "answer-note", "演示回答：使用合成模型，仅用于检查系统流程。"),
-    );
-  if (sourceWarning(answer))
-    root.append(
-      el(
-        "p",
-        "answer-note",
-        "部分来源仍有解析缺口；本回答仅使用已获准入库的内容，未解析或不确定部分不作为证据。",
-      ),
     );
   if (answer.requested_format === "table" && answer.claims.length) {
     const content = {
@@ -571,8 +564,6 @@ export function renderReport(artifact, select) {
       `资料版本 ${artifact.generation_id.slice(0, 12)} · 来源可追溯`,
     ),
   );
-  if (artifact.content.quality !== "answered")
-    page.append(el("p", "answer-note", "来源覆盖有缺口，仅整理已支持内容。"));
   page.append(el("h2", "", "研究要点"));
   for (const fact of artifact.content.facts) {
     const n = el("section", "claim");
@@ -612,11 +603,7 @@ export function renderSlides(artifact, select) {
     {
       title: artifact.title,
       layout: "cover",
-      body:
-        "基于已核验来源整理\n" +
-        (artifact.content.quality === "answered"
-          ? "来源可追溯"
-          : "来源覆盖有缺口"),
+      body: "基于已核验来源整理\n来源可追溯",
       sources: [],
     },
     ...(artifact.content.outline?.length
@@ -746,16 +733,22 @@ export function renderArtifact(artifact, select) {
           ? renderMindmap(c, select)
           : artifact.kind === "slides"
             ? renderSlides(artifact, select)
-            : renderReport(artifact, select);
+            : artifact.kind === "wordcloud"
+              ? renderWordcloud(c, select)
+              : renderReport(artifact, select);
   const root = el("div", "artifact-view");
   if (c.synthetic)
     root.append(el("p", "answer-note", "演示成果：未做真实模型语义校验。"));
-  if (c.quality !== "answered")
-    root.append(
-      el("p", "answer-note", "仅整理已支持内容；请核对原回答的缺口与冲突。"),
-    );
   if (c.organization_notice)
     root.append(el("p", "answer-note", c.organization_notice));
+  if (c.organization === "user_editorial")
+    root.append(
+      el(
+        "p",
+        "answer-note",
+        "人工编排版本；事实与引用保留已校验内容，分组和标题由用户编辑。",
+      ),
+    );
   if (c.organization === "ai_editorial")
     root.append(
       el(

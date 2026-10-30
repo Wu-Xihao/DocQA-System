@@ -12,14 +12,18 @@ import {
   notice,
   toast,
   locationText,
-  sourceWarning,
   richText,
   copy,
   download,
 } from "./dom.js";
 import { api, setToken, plain, uploadBytes, watchConversation } from "./api.js";
 import { openSourceReader, sourcePending } from "./source-reader.js";
+import { imageAnalysis } from "./image-analysis.js";
+import { editArtifact, visualCheck } from "./studio-editor.js";
+import { uploadProgress, uploadBatchStatus } from "./upload-progress.js";
 import { icon, mountIcons } from "./icons.js";
+import { bindSearch } from "./search.js";
+import { bindStats } from "./stats.js";
 import {
   bindMaintenance,
   showImageAnalysis,
@@ -34,10 +38,17 @@ import {
 } from "./renderers.js";
 
 const finalStates = new Set(["succeeded", "failed", "cancelled"]);
+const sidebarSections = ["documents", "scope", "history", "maintenance"];
+let resolveConnection;
+const connectionReady = new Promise((resolve) => {
+  resolveConnection = resolve;
+});
 const state = {
+  mode: "retrieval",
   types: null,
   conversation: null,
   documents: [],
+  documentLimit: 80,
   libraryDocuments: [],
   documentSequence: 0,
   uploads: [],
@@ -48,6 +59,7 @@ const state = {
   activeAnswer: null,
   history: [],
   historyCursor: null,
+  historySequence: 0,
   archived: false,
   messageCursor: null,
   epoch: 0,
@@ -153,25 +165,44 @@ function effectiveDocuments() {
   );
 }
 function updateScope() {
-  const selected = effectiveDocuments(),
-    gaps = selected.filter((d) =>
-      ["native_only", "validated_parts"].includes(d.quality),
-    ).length;
-  const summary = `${state.types === null ? "全部类型" : state.types.map((x) => x.toUpperCase()).join(" + ") || "未选类型"} · ${selected.length} 份资料${gaps ? ` · ${gaps} 份有覆盖缺口` : ""}`;
+  const selected = effectiveDocuments();
+  const chat = state.mode === "chat";
+  const summary = chat
+    ? "正常聊天 · 对话 API"
+    : `${state.types === null ? "全部类型" : state.types.map((x) => x.toUpperCase()).join(" + ") || "未选类型"} · ${selected.length} 份资料`;
   text("scope-summary", summary);
-  text("composer-scope", `${selected.length} 份资料`);
+  text(
+    "composer-scope",
+    chat ? "直接调用对话 API" : `${selected.length} 份资料`,
+  );
+  $("mode-select").value = state.mode;
+  $("mode-select").disabled = !!activeJob() || state.submitting;
+  $("format-select").hidden = chat;
+  $("attach-button").hidden = chat;
+  text(
+    "mode-help",
+    chat
+      ? "正常聊天不会检索文档，回复由对话模型直接生成。"
+      : "回答以所选资料为限，请结合来源核对。",
+  );
+  $("question-input").placeholder = chat
+    ? "和 AI 聊聊，或继续追问…"
+    : "向你的资料提问，或继续追问…";
+  if (!state.activeAnswer) sourceEmptyText(chat);
   text(
     "scope-count",
     state.scopeMode === "all" ? "全部" : String(selected.length),
   );
   text(
     "scope-help",
-    selected.length
-      ? "只查找选中资料；运行中调整只影响下一轮。"
-      : "当前未选择资料，发送前请至少勾选一份。",
+    chat
+      ? "当前为正常聊天，资料筛选仅在文档检索模式生效。"
+      : selected.length
+        ? "只查找选中资料；运行中调整只影响下一轮。"
+        : "当前未选择资料，发送前请至少勾选一份。",
   );
   $("ask-button").disabled =
-    !selected.length || !!activeJob() || state.submitting;
+    (!chat && !selected.length) || !!activeJob() || state.submitting;
   const generation = state.conversation?.generation_id;
   text("generation-id", generation ? generation.slice(0, 8) : "");
   show(
@@ -219,13 +250,14 @@ function drawDocuments() {
     ...state.libraryDocuments,
     ...state.documents.filter((d) => !latest.has(d.doc_id)),
   ];
-  for (const doc of rows.filter(
+  const visible = rows.filter(
     (d) =>
       (!state.category || d.category === state.category) &&
       (state.types === null ||
         state.types.includes(d.source_name.split(".").at(-1).toLowerCase())) &&
       d.source_name.toLowerCase().includes(query),
-  )) {
+  );
+  for (const doc of visible.slice(0, state.documentLimit)) {
     const row = el("div", "document-row"),
       input = el("input");
     row.dataset.docId = doc.doc_id;
@@ -261,9 +293,7 @@ function drawDocuments() {
             ? "仅在当前对话旧版中可用"
             : updated
               ? "资料已更新 · 当前对话使用旧版"
-              : ["native_only", "validated_parts"].includes(doc.quality)
-                ? "正文可用 · 解析有缺口"
-                : "已入库 · 可用于提问",
+              : "已入库 · 可用于提问",
       ),
     );
     const actions = [["查看原文与 Markdown", () => previewDocument(doc)]];
@@ -299,6 +329,16 @@ function drawDocuments() {
     );
     $("documents-list").append(row);
   }
+  if (visible.length > state.documentLimit)
+    $("documents-list").append(
+      button(
+        `加载更多资料（剩余 ${visible.length - state.documentLimit} 份）`,
+        () => {
+          state.documentLimit += 80;
+          drawDocuments();
+        },
+      ),
+    );
   if (!$("documents-list").children.length)
     $("documents-list").append(
       el(
@@ -321,13 +361,26 @@ const uploadLabels = {
   parsing: "正在解析资料",
   indexing: "正在构建知识库",
   ready: "已入库",
-  ready_with_gaps: "正文已入库 · 有解析缺口",
+  ready_with_gaps: "已入库 · 可用于提问",
   failed: "处理失败",
   review_required: "需复核，尚未入库",
   upload_failed: "上传失败",
   cancelled: "已取消",
 };
 function drawUploads() {
+  const snapshot = JSON.stringify([
+    state.uploads,
+    [...state.localUploads.values()],
+    state.catalogueRevision,
+    state.category,
+    state.types,
+    $("document-search").value,
+  ]);
+  if (snapshot === state.uploadSnapshot) {
+    drawUploadBatch();
+    return;
+  }
+  state.uploadSnapshot = snapshot;
   clear("uploads-list");
   const query = $("document-search").value.trim().toLowerCase();
   const hiddenByFilter = (u) => {
@@ -356,6 +409,7 @@ function drawUploads() {
   for (const u of [...records.values()].slice(0, 12)) {
     const row = el("div", "upload-row");
     row.dataset.uploadId = u.id;
+    row.dataset.state = u.state;
     const filteredReady =
       ["ready", "ready_with_gaps"].includes(u.state) && hiddenByFilter(u);
     row.append(
@@ -392,7 +446,18 @@ function drawUploads() {
       const progress = el("progress");
       progress.max = u.size;
       progress.value = u.received || 0;
+      progress.setAttribute("aria-label", u.name + "：文件传输进度");
       row.append(progress);
+    }
+    const processing = uploadProgress(u);
+    if (processing) {
+      const progress = el("progress", "ingestion-progress");
+      progress.setAttribute("aria-label", u.name + "：" + processing.label);
+      if (processing.total !== null) {
+        progress.max = processing.total;
+        progress.value = processing.current;
+      }
+      row.append(el("small", "upload-stage", processing.label), progress);
     }
     if (u.doc_id && u.state === "failed")
       row.append(button("重新处理", () => safe(reprocess)(u.doc_id)));
@@ -421,13 +486,49 @@ function drawUploads() {
     }
     $("uploads-list").append(row);
   }
+  drawUploadBatch();
 }
-async function loadDocuments() {
+function drawUploadBatch() {
+  const batch = state.uploadBatch;
+  if (!batch) {
+    text("folder-upload-status", "");
+    show("folder-upload-status", false);
+    show("folder-upload-progress", false);
+    return;
+  }
+  for (const u of state.uploads)
+    if (batch.items.has(u.id)) batch.items.set(u.id, u);
+  for (const u of state.localUploads.values())
+    if (batch.items.has(u.id)) batch.items.set(u.id, u);
+  const view = uploadBatchStatus({
+    ...batch,
+    transferring: state.uploadBatchActive,
+  });
+  if (view.hidden) state.uploadBatch = null;
+  text("folder-upload-status", view.hidden ? "" : view.text);
+  show("folder-upload-status", !view.hidden);
+  show("folder-upload-progress", !view.hidden);
+  const progress = $("folder-upload-progress");
+  progress.max = view.total;
+  progress.value = view.value;
+  progress.setAttribute("aria-valuetext", view.text);
+}
+const documentLoads = new Map();
+function loadDocuments() {
   const epoch = state.epoch;
-  const sequence = ++state.documentSequence;
   const path =
     "/documents" +
     (state.conversation ? "?conversation_id=" + state.conversation.id : "");
+  const key = epoch + "|" + path;
+  if (documentLoads.has(key)) return documentLoads.get(key);
+  const pending = loadDocumentSnapshot(path, epoch).finally(() =>
+    documentLoads.delete(key),
+  );
+  documentLoads.set(key, pending);
+  return pending;
+}
+async function loadDocumentSnapshot(path, epoch) {
+  const sequence = ++state.documentSequence;
   const data = await api(path);
   if (epoch !== state.epoch || sequence !== state.documentSequence) return;
   state.documents = data.documents;
@@ -443,23 +544,35 @@ async function loadDocuments() {
       state.localUploads.delete(upload.id);
   }
   state.latestGeneration = data.latest_generation_id ?? data.generation_id;
-  const old = state.category;
-  clear("category-select");
-  $("category-select").append(el("option", "", "全部分类"));
-  $("category-select").firstChild.value = "";
-  for (const category of [
-    ...new Set(
-      [...state.libraryDocuments, ...state.documents].map((d) => d.category),
-    ),
-  ]) {
-    const o = el("option", "", category);
-    o.value = category;
-    $("category-select").append(o);
-  }
-  if ([...$("category-select").options].some((o) => o.value === old))
-    $("category-select").value = old;
-  else state.category = "";
-  drawDocuments();
+  const snapshot = JSON.stringify([
+    path,
+    state.documents,
+    state.libraryDocuments,
+    state.latestGeneration,
+    data.recall_routes,
+  ]);
+  const changed = snapshot !== state.catalogueSnapshot;
+  state.catalogueSnapshot = snapshot;
+  if (changed) {
+    state.catalogueRevision = (state.catalogueRevision || 0) + 1;
+    const old = state.category;
+    clear("category-select");
+    $("category-select").append(el("option", "", "全部分类"));
+    $("category-select").firstChild.value = "";
+    for (const category of [
+      ...new Set(
+        [...state.libraryDocuments, ...state.documents].map((d) => d.category),
+      ),
+    ]) {
+      const o = el("option", "", category);
+      o.value = category;
+      $("category-select").append(o);
+    }
+    if ([...$("category-select").options].some((o) => o.value === old))
+      $("category-select").value = old;
+    else state.category = "";
+    drawDocuments();
+  } else updateScope();
   drawUploads();
   text("library-refresh-status", "");
   text(
@@ -488,10 +601,12 @@ function historyGroup(timestamp, pinned) {
         : "更早";
 }
 async function refreshHistory(append = false) {
+  const sequence = ++state.historySequence;
   const query = $("history-search").value;
   const data = await api(
     `/conversations?q=${encodeURIComponent(query)}&archived=${state.archived}&cursor=${append ? state.historyCursor || 0 : 0}`,
   );
+  if (sequence !== state.historySequence) return;
   state.history = append ? [...state.history, ...data.items] : data.items;
   state.historyCursor = data.next_cursor;
   clear("history-list");
@@ -621,6 +736,7 @@ async function newChat() {
   stopWatching();
   state.epoch++;
   state.conversation = null;
+  state.mode = "retrieval";
   state.messages = [];
   state.activeAnswer = null;
   state.pendingRelation = false;
@@ -673,6 +789,8 @@ async function loadMessages(older = false) {
   );
   if (epoch !== state.epoch) return;
   state.messages = older ? [...data.items, ...state.messages] : data.items;
+  if (!older && data.items.length)
+    state.mode = data.items.at(-1).scope?.interaction_mode || "retrieval";
   state.messageCursor = data.next_cursor;
   show("more-messages", data.next_cursor !== null);
   drawMessages(older);
@@ -680,7 +798,8 @@ async function loadMessages(older = false) {
   const current = answers.find(
     (m) => m.job.answer.answer_id === state.activeAnswer?.answer_id,
   );
-  if (current) state.activeAnswer = current.job.answer;
+  if (state.messages.at(-1)?.job?.mode === "chat") focusChat();
+  else if (current) state.activeAnswer = current.job.answer;
   else if (answers.length) focusAnswer(answers.at(-1).job.answer);
   updateScope();
   if (activeJob()) startWatching();
@@ -714,7 +833,24 @@ function drawMessages(keepScroll = false) {
       const job = m.job;
       if (!job) continue;
       row.dataset.jobId = job.job_id;
-      if (job.answer) {
+      if (job.chat || job.streaming_chat || job.chat_preview) {
+        const chat = job.chat || job.streaming_chat || job.chat_preview;
+        row.append(chatContent(chat));
+        if (job.chat) {
+          const actions = el("div", "message-actions");
+          actions.append(
+            button("复制", () => copy(chat.content)),
+            button("重新生成", () => safe(retry)(m)),
+          );
+          row.append(actions);
+        } else {
+          row.append(
+            el("small", "stream-label", "正在接收模型实时回复…"),
+            progressBox(job),
+          );
+        }
+        row.addEventListener("click", focusChat);
+      } else if (job.answer) {
         const answer = job.answer;
         row.append(
           messageHeader(answer),
@@ -789,8 +925,8 @@ function progressBox(job) {
   root.append(el("span", "spinner"));
   const content = el("div");
   content.append(
-    el("div", "progress-title", stageNames[job.stage] || "正在处理"),
-    el("div", "progress-meta", elapsed(job.created_at)),
+    el("div", "progress-title", jobStage(job)),
+    el("div", "progress-meta", elapsed(job.created_at, job.mode)),
   );
   root.append(
     content,
@@ -803,8 +939,17 @@ function progressBox(job) {
   );
   return root;
 }
-function elapsed(created) {
-  return `已用时 ${Math.max(0, Math.floor(Date.now() / 1000 - created))} 秒 · 回答检查通过后展示`;
+function jobStage(job) {
+  if (job.mode === "chat") {
+    if (job.stage === "checking_result" || job.stage === "publishing")
+      return "正在保存对话回复";
+    if (["starting", "running", "composing"].includes(job.stage))
+      return "正在调用对话 API";
+  }
+  return stageNames[job.stage] || statusNames[job.state] || "正在处理";
+}
+function elapsed(created, mode = "retrieval") {
+  return `已用时 ${Math.max(0, Math.floor(Date.now() / 1000 - created))} 秒 · ${mode === "chat" ? "正在调用对话 API" : "回答检查通过后展示"}`;
 }
 function retrievalPreview(job) {
   const details = el("details", "retrieval-preview");
@@ -828,9 +973,11 @@ function updateJobs(jobs) {
     message.job = { ...message.job, ...job };
     const row = document.querySelector(`[data-job-id="${job.job_id}"]`);
     if (row && row.querySelector(".progress-title")) {
-      row.querySelector(".progress-title").textContent =
-        stageNames[job.stage] || statusNames[job.state] || job.state;
-      row.querySelector(".progress-meta").textContent = elapsed(job.created_at);
+      row.querySelector(".progress-title").textContent = jobStage(job);
+      row.querySelector(".progress-meta").textContent = elapsed(
+        job.created_at,
+        job.mode,
+      );
       const previous = row.querySelector(".retrieval-preview");
       if (job.retrieval_preview?.length) {
         const preview = retrievalPreview(job);
@@ -879,6 +1026,37 @@ function receiveAnswerStream(data) {
   const id = data.job_id || data.job?.job_id;
   const message = state.messages.find((m) => m.job?.job_id === id);
   if (!message) return;
+  if (data.kind === "chat_live") {
+    message.job.streaming_chat = data.chat;
+    const target = document.querySelector(
+      `[data-job-id="${id}"] .direct-chat-body`,
+    );
+    if (target) target.replaceChildren(richText(data.chat.content));
+    else drawMessages(true);
+    return;
+  }
+  if (data.kind === "chat_start") {
+    message.job.streaming_chat = data.chat;
+    drawMessages(true);
+    return;
+  }
+  if (data.kind === "chat_delta" && message.job.streaming_chat) {
+    message.job.streaming_chat.content += data.text;
+    const target = document.querySelector(
+      `[data-job-id="${id}"] .direct-chat-body`,
+    );
+    target?.replaceChildren(richText(message.job.streaming_chat.content));
+    return;
+  }
+  if (data.kind === "chat_done") {
+    message.job = data.job;
+    drawMessages(true);
+    focusChat();
+    updateScope();
+    stopWatching();
+    safe(refreshHistory)();
+    return;
+  }
   if (data.kind === "answer_start") {
     message.job.streaming_answer = data.answer;
     drawMessages(true);
@@ -906,9 +1084,10 @@ function receiveAnswerStream(data) {
 async function submitQuestion(event, override, relation = false) {
   event?.preventDefault();
   const question = override?.question || $("question-input").value.trim();
+  const mode = override?.mode || (relation ? "retrieval" : state.mode);
   if (!question || activeJob() || state.submitting) return;
   const selected = effectiveDocuments();
-  if (!selected.length) {
+  if (mode !== "chat" && !selected.length) {
     toast("请至少选择一份已入库资料。");
     return;
   }
@@ -927,6 +1106,7 @@ async function submitQuestion(event, override, relation = false) {
       text("conversation-title", "新对话");
     }
     const payload = {
+      mode,
       question,
       client_request_id: id(),
       scope_mode: state.scopeMode,
@@ -937,6 +1117,15 @@ async function submitQuestion(event, override, relation = false) {
       output_format: $("format-select").value,
       ...override,
     };
+    if (payload.mode === "chat")
+      Object.assign(payload, {
+        scope_mode: "all",
+        categories: null,
+        doc_types: null,
+        doc_ids: null,
+        topics: null,
+        output_format: "markdown",
+      });
     delete payload.scope;
     const conversationId = state.conversation.id;
     const fingerprint = JSON.stringify({ ...payload, client_request_id: null });
@@ -986,6 +1175,7 @@ async function retry(m) {
 }
 
 function focusAnswer(answer) {
+  sourceEmptyText(false);
   const changed = state.activeAnswer?.answer_id !== answer.answer_id;
   state.activeAnswer = answer;
   text("sources-count", answer.citations.length);
@@ -1015,6 +1205,45 @@ function focusAnswer(answer) {
   }
   for (const b of $("studio-actions").querySelectorAll("button"))
     b.disabled = !answer.claims?.length;
+}
+
+function chatContent(chat) {
+  const root = el("div", "direct-chat");
+  const head = el("div", "assistant-head");
+  head.append(
+    icon("chat", 22),
+    el("strong", "", "DocQA"),
+    el("span", "badge", "正常聊天"),
+  );
+  const body = el("div", "answer-body direct-chat-body");
+  body.append(richText(chat.content));
+  root.append(head, body);
+  if (chat.synthetic)
+    root.append(el("small", "subtle", "演示聊天：未调用真实模型 API。"));
+  return root;
+}
+
+function focusChat() {
+  sourceEmptyText(true);
+  state.activeAnswer = null;
+  state.images = [];
+  clear("citations-list");
+  clear("source-detail");
+  clear("images-list");
+  text("sources-count", "0");
+  text("studio-context", "正常聊天未检索资料；成果需基于文档检索回答生成。");
+  show("sources-empty");
+  for (const b of $("studio-actions").querySelectorAll("button"))
+    b.disabled = true;
+}
+function sourceEmptyText(chat) {
+  text("sources-empty-title", chat ? "正常聊天" : "答案背后的依据");
+  text(
+    "sources-empty-help",
+    chat
+      ? "本轮由对话模型直接回复，没有检索文档来源。"
+      : "点击回答中的引用，在这里查看原文与定位。",
+  );
 }
 async function openSource(answer, citationId) {
   const sequence = (state.sourceSequence = (state.sourceSequence || 0) + 1);
@@ -1112,7 +1341,8 @@ async function loadImages(append = false, citationId) {
         safe(openSource)(state.activeAnswer, image.citation_id),
       ),
     );
-    card.append(b, info);
+    info.append(button("看图复核（VL）", () => safe(visualCheck)(image, info)));
+    card.append(b, info, imageAnalysis(image, { compact: true }));
     $("images-list").append(card);
   });
   if (!result.total)
@@ -1139,6 +1369,7 @@ function openImage(index) {
       ? "参考图，未参与回答证据 · "
       : "直接引用图 · ") + locationText([image.locator]),
   );
+  $("lightbox-analysis").replaceChildren(imageAnalysis(image));
   resetImage();
   if (!$("image-dialog").open) $("image-dialog").showModal();
 }
@@ -1278,7 +1509,7 @@ async function openArtifact(identity) {
   text("preview-title", a.title);
   text(
     "preview-type",
-    `${artifactTypes[a.kind].label} · V${a.version} · ${a.content.quality === "answered" ? "来源可查" : "来源覆盖有缺口"}`,
+    `${artifactTypes[a.kind].label} · V${a.version} · 来源可查`,
   );
   const select = (ids) => previewSources(a, ids);
   $("preview-content").replaceChildren(renderArtifact(a, select));
@@ -1289,8 +1520,10 @@ async function openArtifact(identity) {
       ? ["csv", "md", "json"]
       : a.kind === "slides"
         ? ["pptx", "md", "json"]
-        : ["relation", "mindmap"].includes(a.kind)
-          ? ["svg", "png", "json"]
+        : ["relation", "mindmap", "wordcloud"].includes(a.kind)
+          ? a.kind === "wordcloud"
+            ? ["svg", "png", "md", "json"]
+            : ["svg", "png", "json"]
           : ["md", "docx", "json"];
   const picker = el("select");
   picker.setAttribute("aria-label", "导出格式");
@@ -1301,6 +1534,12 @@ async function openArtifact(identity) {
   }
   $("preview-actions").append(
     picker,
+    button("编辑编排", () =>
+      editArtifact(a, async (result) => {
+        await loadArtifacts();
+        await openArtifact(result.id);
+      }),
+    ),
     button("导出 ↗", () => safe(exportArtifact)(a, picker.value)),
   );
   if (!$("preview-dialog").open) $("preview-dialog").showModal();
@@ -1314,7 +1553,7 @@ function previewSources(a, ids) {
       "field-help",
       ids.length
         ? "已定位所选内容的引用。"
-        : "点击单元格、节点或引用，查看对应原文。",
+        : "点击单元格、关键词、节点或引用，查看对应原文。",
     ),
   );
   for (const c of a.content.citations.filter(
@@ -1367,6 +1606,8 @@ async function exportArtifact(artifact, format) {
 }
 
 async function uploadFiles(files) {
+  files = Array.from(files);
+  if (!state.capabilities) await connectionReady;
   if (!state.capabilities?.uploads_enabled) {
     toast("当前未启用上传，请按启动说明配置 Service。");
     return;
@@ -1377,39 +1618,43 @@ async function uploadFiles(files) {
   }
   const candidates = Array.from(files);
   const queue = candidates.filter(
-    (f) => /\.(pdf|docx|pptx)$/i.test(f.name) && !f.name.startsWith("~$"),
+    (f) => /\.(pdf|docx|pptx|xlsx|csv)$/i.test(f.name) && !f.name.startsWith("~$"),
   );
   if (queue.length > 1000) {
     toast("单批最多 1000 份文档，请拆分文件夹；本次尚未上传。");
     return;
   }
   if (!queue.length) {
-    toast("未发现 DOCX、PPTX 或 PDF 文档。");
+    toast("未发现 DOCX、PPTX、PDF、XLSX 或 CSV 文档。");
     return;
   }
   state.uploadBatchActive = true;
   const total = queue.length;
+  const batch = {
+    total,
+    items: new Map(),
+    processed: 0,
+    failedWithoutRecord: 0,
+    skipped: 0,
+  };
+  state.uploadBatch = batch;
   let completed = 0,
     failed = 0,
     lastRefresh = 0;
-  text(
-    "folder-upload-status",
-    `发现 ${total} 份文档，忽略 ${candidates.length - total} 个非支持文件。准备上传…`,
-  );
+  drawUploadBatch();
   async function worker() {
     while (queue.length) {
       const file = queue.shift();
-      if (!/\.(pdf|docx|pptx)$/i.test(file.name)) {
+      if (!/\.(pdf|docx|pptx|xlsx|csv)$/i.test(file.name)) {
         toast(`${file.name}：不支持的格式`);
         continue;
       }
       if (file.size > state.capabilities.max_upload_bytes || !file.size) {
         toast(`${file.name}：文件为空或超过大小限制`);
         failed++;
-        text(
-          "folder-upload-status",
-          `已处理 ${completed + failed}/${total} · 失败 ${failed}`,
-        );
+        batch.failedWithoutRecord++;
+        batch.processed = completed + failed;
+        drawUploadBatch();
         continue;
       }
       let record;
@@ -1423,6 +1668,7 @@ async function uploadFiles(files) {
             relative_path: file.webkitRelativePath || null,
           },
         });
+        batch.items.set(record.id, record);
         state.localUploads.set(record.id, record);
         drawUploads();
         window.dispatchEvent(new Event("docqa:library-dirty"));
@@ -1441,32 +1687,42 @@ async function uploadFiles(files) {
         ) {
           await api("/uploads/" + record.id, { method: "DELETE" });
           state.localUploads.delete(record.id);
+          batch.items.delete(record.id);
+          batch.skipped++;
           drawUploads();
           completed++;
+          batch.processed = completed + failed;
+          drawUploadBatch();
           continue;
         }
-        await api(`/uploads/${record.id}/commit`, { method: "POST", body: {} });
-        state.localUploads.delete(record.id);
+        const committed = await api(`/uploads/${record.id}/commit`, {
+          method: "POST",
+          body: {},
+        });
+        state.localUploads.set(record.id, committed);
+        batch.items.set(record.id, committed);
+        completed++;
+        batch.processed = completed + failed;
+        drawUploads();
         if (performance.now() - lastRefresh > 1000) {
           lastRefresh = performance.now();
-          await loadDocuments();
+          await refreshLibrary(false);
         }
-        completed++;
       } catch (error) {
-        if (record)
+        if (record) {
           state.localUploads.set(record.id, {
             ...record,
             state: "upload_failed",
             error_code: error.code || "UPLOAD_INCOMPLETE",
           });
+          batch.items.set(record.id, state.localUploads.get(record.id));
+        } else batch.failedWithoutRecord++;
         drawUploads();
         toast(errorText(error));
         failed++;
       }
-      text(
-        "folder-upload-status",
-        `传输 ${completed + failed}/${total} · 成功 ${completed} · 失败 ${failed}；已传输文件按队列解析入库。`,
-      );
+      batch.processed = completed + failed;
+      drawUploadBatch();
     }
   }
   try {
@@ -1476,6 +1732,7 @@ async function uploadFiles(files) {
     $("file-input").value = "";
     $("folder-input").value = "";
     state.uploadBatchActive = false;
+    drawUploadBatch();
   }
 }
 async function reprocess(doc) {
@@ -1582,8 +1839,26 @@ function resizePanel(handle, variable, side, min, max) {
 }
 
 function bind() {
+  setUploadAvailability(false);
+  $("mode-select").addEventListener("change", () => {
+    state.mode = $("mode-select").value;
+    if (state.mode === "chat") focusChat();
+    updateScope();
+    $("question-input").focus();
+  });
   mountIcons();
   bindMaintenance();
+  // Snippet search reuses the sidebar scope as a hard boundary when enabled.
+  bindSearch(() => ({
+    conversation_id: state.conversation?.id || null,
+    categories: state.category ? [state.category] : null,
+    doc_types: state.types,
+    doc_ids:
+      state.scopeMode === "selected"
+        ? effectiveDocuments().map((d) => d.doc_id)
+        : null,
+  }));
+  bindStats();
   $("folder-upload").addEventListener("click", () => $("folder-input").click());
   $("folder-input").addEventListener("change", () =>
     safe(uploadFiles)($("folder-input").files),
@@ -1593,10 +1868,10 @@ function bind() {
     const chosen = typeBoxes
       .filter((b) => b.checked)
       .map((b) => b.dataset.docType);
-    $("types-all").checked = chosen.length === 3;
-    state.types = chosen.length === 3 ? null : chosen;
+    $("types-all").checked = chosen.length === typeBoxes.length;
+    state.types = chosen.length === typeBoxes.length ? null : chosen;
     drawDocuments();
-    updateScope();
+    drawUploads();
   };
   $("types-all").addEventListener("change", () => {
     typeBoxes.forEach((b) => {
@@ -1652,9 +1927,13 @@ function bind() {
     drawDocuments();
     drawUploads();
   });
+  let documentSearchTimer;
   $("document-search").addEventListener("input", () => {
-    drawDocuments();
-    drawUploads();
+    clearTimeout(documentSearchTimer);
+    documentSearchTimer = setTimeout(() => {
+      drawDocuments();
+      drawUploads();
+    }, 120);
   });
   $("select-all").addEventListener("click", () => {
     state.scopeMode = "all";
@@ -1731,6 +2010,7 @@ function bind() {
   );
   for (const [k, v] of Object.entries(artifactTypes)) {
     const b = button("", () => safe(generateArtifact)(k), "studio-action");
+    b.dataset.artifactKind = k;
     const label = el("span");
     label.append(el("strong", "", v.label), el("small", "", v.hint));
     b.append(icon(k, 23), label);
@@ -1744,14 +2024,33 @@ function bind() {
   ])
     $(trigger).addEventListener("click", () => togglePanel(panel));
   $("theme-button").addEventListener("click", () => {
+    document.documentElement.classList.add("theme-switching");
     const dark = document.documentElement.dataset.theme !== "dark";
     document.documentElement.dataset.theme = dark ? "dark" : "light";
     savePrefs({ theme: dark ? "dark" : "light" });
-  });
-  for (const name of ["documents", "scope", "history"])
-    $(name + "-section").addEventListener("toggle", () =>
-      savePrefs({ [name + "Open"]: $(name + "-section").open }),
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() =>
+        document.documentElement.classList.remove("theme-switching"),
+      ),
     );
+  });
+  for (const name of sidebarSections) {
+    const section = $(name + "-section");
+    section.addEventListener("toggle", () => {
+      // Native details[name] closes siblings synchronously. Keep this fallback
+      // for hosts without that support; nested row menus/help are not siblings.
+      if (section.open)
+        for (const other of sidebarSections)
+          if (other !== name) $(other + "-section").open = false;
+      savePrefs({
+        sidebarSection:
+          sidebarSections.find((key) => $(key + "-section").open) ?? null,
+        ...Object.fromEntries(
+          sidebarSections.map((key) => [key + "Open", $(key + "-section").open]),
+        ),
+      });
+    });
+  }
   $("close-preview").addEventListener("click", () =>
     $("preview-dialog").close(),
   );
@@ -1782,6 +2081,7 @@ function bind() {
 }
 
 async function initialize() {
+  document.documentElement.dataset.serviceState = "connecting";
   const p = prefs();
   if (p.theme) document.documentElement.dataset.theme = p.theme;
   for (const variable of ["--left", "--right"])
@@ -1795,9 +2095,15 @@ async function initialize() {
       );
   if (p.leftHidden) $("workspace").classList.add("left-hidden");
   if (p.rightHidden) $("workspace").classList.add("right-hidden");
-  for (const name of ["documents", "scope", "history"])
-    if (p[name + "Open"] !== undefined)
-      $(name + "-section").open = !!p[name + "Open"];
+  let activeSection = p.sidebarSection;
+  if (activeSection !== null && !sidebarSections.includes(activeSection))
+    activeSection =
+      sidebarSections.find((name) => p[name + "Open"] === true) ??
+      (sidebarSections.some((name) => p[name + "Open"] === false)
+        ? null
+        : "documents");
+  for (const name of sidebarSections)
+    $(name + "-section").open = name === activeSection;
   bind();
   window.dispatchEvent(new CustomEvent("docqa:bound"));
   try {
@@ -1813,13 +2119,19 @@ async function initialize() {
         ? "演示模式：用于验证功能与交互，不代表真实模型质量。"
         : "",
     );
-    await Promise.all([
+    const preparations = await Promise.allSettled([
       api("/workspace").then((value) => {
         state.capabilities = value;
+        setUploadAvailability(value.uploads_enabled);
+        document.documentElement.dataset.serviceState = "ready";
+        resolveConnection();
+        window.dispatchEvent(new CustomEvent("docqa:ready", { detail: value }));
       }),
       loadDocuments(),
       refreshHistory(),
     ]);
+    const failure = preparations.find((result) => result.status === "rejected");
+    if (failure) throw failure.reason;
     if (state.history.length && !$("question-input").value.trim())
       await openConversation(state.history[0].id);
     if (!state.capabilities.uploads_enabled) {
@@ -1827,8 +2139,13 @@ async function initialize() {
       $("dropzone").title = "独立查询模式，需配置 Service 索引以启用上传。";
     }
   } catch (error) {
+    document.documentElement.dataset.serviceState = "error";
+    resolveConnection();
     notice(errorText(error), true);
-    text("connection-status", "连接异常");
+    text(
+      "connection-status",
+      state.capabilities ? "● 本地服务已连接" : "连接异常",
+    );
   }
   setInterval(() => {
     const job = activeJob();
@@ -1836,7 +2153,7 @@ async function initialize() {
       const row = document.querySelector(
         `[data-job-id="${job.job_id}"] .progress-meta`,
       );
-      if (row) row.textContent = elapsed(job.created_at);
+      if (row) row.textContent = elapsed(job.created_at, job.mode);
     }
   }, 1000);
   let stopped = false,
@@ -1851,9 +2168,11 @@ async function initialize() {
     polling = false;
     if (!stopped) {
       const busy =
-        state.localUploads.size ||
-        state.uploads.some((u) =>
-          ["committed", "queued", "parsing", "indexing"].includes(u.state),
+        state.uploadBatchActive ||
+        [...state.localUploads.values(), ...state.uploads].some((u) =>
+          ["uploading", "committed", "queued", "parsing", "indexing"].includes(
+            u.state,
+          ),
         );
       timer = setTimeout(poll, refreshSoon ? 1000 : busy ? 3000 : 15000);
       refreshSoon = false;
@@ -1880,12 +2199,31 @@ async function initialize() {
   });
   window.addEventListener("pagehide", stopWatching);
 }
+function setUploadAvailability(enabled) {
+  for (const id of [
+    "file-input",
+    "folder-input",
+    "folder-upload",
+    "attach-button",
+  ])
+    $(id).disabled = !enabled;
+  $("dropzone").setAttribute("aria-disabled", String(!enabled));
+}
 async function refreshLibrary(manual = true) {
-  if (manual) text("library-refresh-status", "正在刷新资料库…");
+  if (manual) {
+    text("library-refresh-status", "正在刷新资料库…");
+    $("refresh-documents").disabled = true;
+    $("refresh-documents").setAttribute("aria-busy", "true");
+  }
   try {
     await loadDocuments();
   } catch (error) {
     text("library-refresh-status", "资料库刷新失败：" + errorText(error));
+  } finally {
+    if (manual) {
+      $("refresh-documents").disabled = false;
+      $("refresh-documents").removeAttribute("aria-busy");
+    }
   }
 }
 async function useLatestLibrary() {
@@ -1905,6 +2243,7 @@ async function useLatestLibrary() {
   toast("下一轮将使用新的资料版本，历史回答保留原版来源。");
 }
 initialize().catch((error) => {
+  resolveConnection();
   notice("交互初始化失败：" + errorText(error) + "。请刷新页面重试。", true);
   text("connection-status", "初始化失败");
 });

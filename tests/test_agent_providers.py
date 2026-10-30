@@ -161,6 +161,43 @@ def test_one_format_repair_is_data_and_strict_types_are_enforced():
     assert client._request("verify", {}, TinyResponse, None).supported
     assert len(calls) == 2
     assert calls[1]["format_repair"]["previous_output"] == '{"supported":"true"}'
+    assert calls[1]["format_repair"]["violations"] == ["supported:bool_type"]
+
+
+def test_truncated_json_is_regenerated_once_with_bounded_larger_budget():
+    calls = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        calls.append(payload)
+        value = envelope('{"supported":true}')
+        if len(calls) == 1:
+            value["choices"][0]["finish_reason"] = "length"
+            value["choices"][0]["message"]["content"] = '{"supported":'
+        return httpx.Response(200, json=value)
+
+    client = HttpChatClient(config(max_output_tokens=1024), transport=httpx.MockTransport(handler))
+    assert client._request("verify", {}, TinyResponse, None).supported
+    assert len(calls) == 2
+    assert calls[1]["max_tokens"] == 2048
+    repair = json.loads(calls[1]["messages"][1]["content"])["format_repair"]
+    assert repair["previous_output"] is None  # No attempt to salvage truncated JSON.
+
+
+def test_truncation_repair_does_not_extend_expired_deadline():
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        value = envelope()
+        value["choices"][0]["finish_reason"] = "length"
+        return httpx.Response(200, json=value)
+
+    client = HttpChatClient(config(), transport=httpx.MockTransport(handler))
+    with pytest.raises(DocQAError) as failure:
+        client._request("verify", {}, TinyResponse, time.monotonic() - 1)
+    assert failure.value.code == "AGENT_DEADLINE_EXCEEDED"
+    assert not calls
 
 
 @pytest.mark.parametrize(

@@ -50,6 +50,7 @@ class ParseOptions(Contract):
     tessdata_dir: str | None = None
     ocr_languages: str = "chi_sim+eng"
     external_timeout: float = Field(default=60, gt=0, le=600)
+    image_workers: int = Field(default=1, ge=1, le=4)
     analysis_revision: str = "1"
     vision: VisionConfig = Field(default_factory=VisionConfig)
 

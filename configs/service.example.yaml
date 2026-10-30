@@ -6,6 +6,8 @@ types:
 - pdf
 - docx
 - pptx
+- xlsx
+- csv
 settle_seconds: 3
 scan_interval_seconds: 1800
 missing_confirmations: 2
@@ -32,6 +34,7 @@ parse:
   tessdata_dir: null
   ocr_languages: chi_sim+eng
   external_timeout: 120
+  image_workers: 2
   analysis_revision: qwen-vision-v1
   vision:
     mode: http
@@ -40,8 +43,8 @@ parse:
     revision: gitee-managed-unpinned
     api_key_env: GITEE_AI_API_KEY
     enable_thinking: false
-    timeout: 120
-    retries: 1
+    timeout: 60
+    retries: 0
 retrieval:
   mode: http
   vector_backend: sqlite_vec

@@ -33,17 +33,29 @@ def _body(block: Block, ir: DocumentIR) -> str:
     if block.type == "heading":
         return "#" * (block.heading_level or 2) + " " + escape_text(block.text)
     if block.type == "table":
+        prefix = ""
+        if block.metadata.get("continuation_previous"):
+            previous = block.metadata["continuation_previous"]
+            prefix = (
+                f"> 可能续接前页表格（版式规则关联，需核对）：[上一部分](#block-{previous})\n\n"
+            )
         body = _table(block.table_rows) or escape_text(block.text)
         note = "表格首行用于 Markdown 展示，不代表已确认它是原文表头。"
         if block.metadata.get("cell_layout"):
             note += " 原表含单元格布局信息，完整合并关系请核对 IR 与原文。"
-        return body + "\n\n> " + note
+        return prefix + body + "\n\n> " + note
     if block.type == "figure":
         figures = {item.figure_id: item for item in ir.figures}
         assets = {item.asset_id: item for item in ir.assets}
         parts = []
         for figure_id in block.figure_ids:
             figure = figures[figure_id]
+            if figure.metadata.get("role") == "page_ocr":
+                parts.append(
+                    f"正文 OCR 位置：{escape_text(figure.locator.display_label)}（整页扫描，仅作正文转录）"
+                )
+                # The OCR paragraph is rendered separately with its own source map.
+                continue
             asset = assets[figure.asset_id]
             label = " ".join((figure.caption or figure.locator.display_label).splitlines())
             label = str(figure.metadata.get("trace_name", label))

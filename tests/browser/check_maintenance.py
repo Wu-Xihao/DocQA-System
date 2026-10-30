@@ -92,7 +92,7 @@ with sync_playwright() as p:
 
     write("Protocol: WATCH_BROWSER first revision.")
     page.locator("#maintenance-section > summary").click()
-    expect(page.locator("#watch-allowed")).to_contain_text("允许目录")
+    page.locator("#watch-new").click()
     page.locator("#watch-path").fill(str(watch))
     page.locator("#watch-interval").fill("15")
     page.locator('[data-watch-type="pdf"]').uncheck()
@@ -124,14 +124,20 @@ with sync_playwright() as p:
         "Automatic poll did not update the modified document"
     )
     page.locator("#index-status").click()
-    expect(page.locator("#index-status-text")).to_contain_text("SQLite-vec", timeout=30000)
+    expect(page.locator("#index-status-text")).to_contain_text("份资料", timeout=30000)
+    assert (
+        context.request.get(base + "/api/v1/maintenance/index", headers=headers).json()[
+            "vector_backend"
+        ]
+        == "sqlite_vec"
+    )
     page.screenshot(path=str(output / "watch-manager.png"))
     checks.append(
         "recursive DOCX watch auto-ingests and later updates a changed file; vector status is SQLite-vec"
     )
     page.set_viewport_size({"width": 390, "height": 844})
     page.locator("#toggle-left").click()
-    expect(page.locator("#watch-add")).to_be_visible()
+    expect(page.locator("#watch-new")).to_be_visible()
     assert not errors, errors
     browser.close()
 report = {"status": "passed", "checks": checks, "browser_errors": errors, "real_model_calls": False}

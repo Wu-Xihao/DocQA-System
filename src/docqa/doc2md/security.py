@@ -10,7 +10,7 @@ from zipfile import BadZipFile, ZipFile
 from docqa.doc2md.config import ParseOptions
 from docqa.domain.errors import DocQAError
 
-SUPPORTED = {".pdf": "pdf", ".docx": "docx", ".pptx": "pptx"}
+SUPPORTED = {".pdf": "pdf", ".docx": "docx", ".pptx": "pptx", ".xlsx": "xlsx", ".csv": "csv"}
 LEGACY = {".doc": "doc", ".ppt": "ppt"}
 
 
@@ -50,7 +50,7 @@ def validate_source(source: Path, options: ParseOptions) -> tuple[Path, str, boo
                 raise DocQAError("UNSUPPORTED_FORMAT", "DOC/PPT needs explicit legacy conversion")
             return resolved, LEGACY[suffix], True
         if suffix not in SUPPORTED:
-            raise DocQAError("UNSUPPORTED_FORMAT", "Supported native formats: PDF, DOCX, PPTX")
+            raise DocQAError("UNSUPPORTED_FORMAT", "Supported native formats: PDF, DOCX, PPTX, XLSX, CSV")
         return resolved, SUPPORTED[suffix], False
     except (FileNotFoundError, PermissionError, OSError) as exc:
         raise DocQAError("SOURCE_ACCESS_DENIED", "Input cannot be read") from exc
@@ -67,13 +67,21 @@ def inspect_snapshot(path: Path, fmt: str, options: ParseOptions) -> dict:
         if not signature.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
             raise DocQAError("FORMAT_MISMATCH", "Legacy Office signature is invalid")
         return {"legacy": True}
+    if fmt == "csv":
+        if b"\x00" in signature or signature.startswith((b"PK", bytes.fromhex("D0CF11E0"))):
+            raise DocQAError("FORMAT_MISMATCH", "CSV extension does not match delimited text")
+        return {}
     if signature.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
         raise DocQAError(
             "PROTECTED_OR_BINARY_OFFICE", "Office input is protected or not plain OOXML"
         )
     if not signature.startswith(b"PK"):
         raise DocQAError("FORMAT_MISMATCH", "Office extension does not match a ZIP container")
-    expected = "word/document.xml" if fmt == "docx" else "ppt/presentation.xml"
+    expected = {
+        "docx": "word/document.xml",
+        "pptx": "ppt/presentation.xml",
+        "xlsx": "xl/workbook.xml",
+    }[fmt]
     external_resources = False
     try:
         with ZipFile(path) as archive:

@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from hashlib import sha256
@@ -28,6 +29,7 @@ from docqa.docbase.storage import (
     read_current,
 )
 from docqa.domain.errors import DocQAError
+from docqa.domain.formats import UPLOAD_FORMATS
 from docqa.service.config import ServiceOptions
 from docqa.service.config import load_options as load_service_options
 from docqa.service.pipeline import Service
@@ -46,12 +48,16 @@ class Workspace:
         self.deletions = DeletionService(self)
         self.shutdown = threading.Event()
         self.thread = self.process = None
+        self.visual_thread = None
         self.worker_error = None
         self._last_spawn = 0
         self._last_monitor_poll = 0
         self._members_generation, self._members = None, {}
         self._display_catalogs = {}
         self._display_lock = threading.Lock()
+        from docqa.web.search import SearchMetrics
+
+        self.search_metrics = SearchMetrics()
         self.upload_root = Path(
             self.options.upload_root or self.options.state / "uploaded-sources"
         ).resolve()
@@ -72,10 +78,10 @@ class Workspace:
             record = json.loads(row["payload"])
             record.update(state="upload_failed", error_code="UPLOAD_INCOMPLETE")
             self.store.object_put("upload", row["owner"], record)
-        for kind in ("artifact_job", "export"):
+        for kind in ("artifact_job", "export", "visual_check"):
             with self.manager.store.transaction() as db:
                 rows = db.execute(
-                    "SELECT owner,payload FROM ws_objects WHERE kind=? AND json_extract(payload,'$.state')='generating'",
+                    "SELECT owner,payload FROM ws_objects WHERE kind=? AND json_extract(payload,'$.state') IN ('generating','running')",
                     (kind,),
                 ).fetchall()
             for row in rows:
@@ -85,9 +91,15 @@ class Workspace:
         self.shutdown.clear()
         self.thread = threading.Thread(target=self._loop, daemon=True, name="docqa-workspace")
         self.thread.start()
+        self.visual_thread = threading.Thread(
+            target=self._visual_loop, daemon=True, name="docqa-visual-checks"
+        )
+        self.visual_thread.start()
 
     def stop(self):
         self.shutdown.set()
+        if self.visual_thread:
+            self.visual_thread.join(timeout=5)
         if self.thread:
             self.thread.join(timeout=5)
         if self.process and self.process.poll() is None:
@@ -154,11 +166,23 @@ class Workspace:
 
         return document_package(self.options.index, identity, generation)
 
-    def submit(self, conversation, owner, value):
+    def submit(self, conversation, owner, value, *, chat_history_override=None):
         previous = self.store.previous_submission(conversation, owner, value)
         if previous:
             return self.manager.store.get(previous, owner)
         selected = self.store.get(conversation, owner)
+        if value.mode == "chat":
+            if not self.manager.ready:
+                raise DocQAError("WORKER_UNAVAILABLE", "Question worker is not running")
+            if self.options.agent.mode != "demo":
+                from docqa.agent.providers import HttpChatClient
+
+                HttpChatClient(self.options.agent.generator)  # Only conversation API is required.
+            job_id = self.store.submit(
+                conversation, owner, value, None, None, chat_history_override=chat_history_override
+            )
+            self.manager.wakeup.set()
+            return self.manager.store.get(job_id, owner)
         catalog = self.display_catalog(selected["generation_id"])
         available = [
             d
@@ -219,8 +243,8 @@ class Workspace:
     def create_upload(self, owner, value):
         self.service()  # Validate configuration before receiving any document.
         suffix = Path(value.name).suffix.lower()
-        if suffix not in {".pdf", ".docx", ".pptx"}:
-            raise DocQAError("FORMAT_UNSUPPORTED", "Upload PDF, DOCX or PPTX")
+        if suffix.lstrip(".") not in UPLOAD_FORMATS:
+            raise DocQAError("FORMAT_UNSUPPORTED", "Upload PDF, DOCX, PPTX, XLSX or CSV")
         if value.size > self.options.max_upload_bytes:
             raise DocQAError("BODY_TOO_LARGE", "File exceeds upload limit")
         pending = [
@@ -357,7 +381,7 @@ class Workspace:
         source = service.add_source(
             path.parent.parent,
             category=record["category"],
-            types=["pdf", "docx", "pptx"],
+            types=list(UPLOAD_FORMATS),
             recursive=True,
         )
         documents = service.list_documents()
@@ -473,8 +497,10 @@ class Workspace:
                 for row in db.execute("SELECT id,owner FROM ws_objects WHERE kind='upload'")
             }
         waiting = False
+        build_job = service.queue.latest("build")
         for record in active:
             owner = owners[record["id"]]
+            record.pop("progress", None)
             if record["state"] == "committed":
                 self.deliver_upload(owner, record, service)
                 waiting = True
@@ -502,8 +528,27 @@ class Workspace:
                 else:
                     record.update(state=doc["state"], error_code=doc.get("error_code"))
             else:
-                record["state"] = "indexing" if doc and doc["state"] == "ready" else "parsing"
+                parse_job = (
+                    service.queue.latest(f"parse:{doc['doc_id']}:{doc['target_version']}")
+                    if doc
+                    else None
+                )
+                if doc and doc["state"] == "ready":
+                    record["state"] = "indexing"
+                elif parse_job and parse_job["state"] in {"queued", "retry_wait"}:
+                    record["state"] = "queued"
+                    record["progress"] = {
+                        "stage": parse_job["state"],
+                        "current": None,
+                        "total": None,
+                    }
+                else:
+                    record["state"] = "parsing"
+                    if parse_job and parse_job["state"] == "running":
+                        record["progress"] = (parse_job.get("result") or {}).get("progress")
                 waiting = True
+            if record["state"] == "indexing" and build_job and build_job["state"] == "running":
+                record["progress"] = (build_job.get("result") or {}).get("progress")
             self.store.object_put("upload", owner, record)
         if waiting:
             self._spawn_service(service)
@@ -542,6 +587,44 @@ class Workspace:
         if checksum(path) != record["sha256"]:
             raise DocQAError("SOURCE_HASH_MISMATCH", "Artifact integrity validation failed")
         return json.loads(_io_path(path).read_bytes())
+
+    def edit_artifact(self, owner, identity, value):
+        with self.store.mutations:
+            original = self.artifact(owner, identity)
+            self.store.get(original["conversation_id"], owner)
+            job = self.manager.store.by_answer(original["answer_id"], owner)
+            answer = self.manager.answer(job)
+            if value.plan is not None:
+                if original["kind"] not in {"mindmap", "slides"}:
+                    raise DocQAError(
+                        "ARTIFACT_PLAN_INVALID", "Section editing supports mindmaps and slides"
+                    )
+                value.plan.check_claims(c.claim_id for c in answer.claims)
+                content = build_content(answer, original["kind"], value.plan)
+            else:
+                content = copy.deepcopy(original["content"])
+            content["organization"] = "user_editorial"
+            content.pop("organization_notice", None)
+            artifact = {
+                **original,
+                "id": uuid4().hex,
+                "title": value.title,
+                "content": content,
+                "version": original["version"] + 1,
+                "previous_id": identity,
+                "created_at": time.time(),
+            }
+            path = _safe_path(self.options.state / "studio", artifact["id"] + "/artifact.json")
+            _io_path(path.parent).mkdir(parents=True, exist_ok=True)
+            raw = encoded(artifact).encode()
+            _io_path(path).write_bytes(raw)
+            self.store.object_put(
+                "artifact",
+                owner,
+                {k: v for k, v in artifact.items() if k != "content"}
+                | {"sha256": sha256(raw).hexdigest()},
+            )
+            return artifact
 
     def process_artifacts(self):
         with self.manager.store.transaction() as db:
@@ -629,6 +712,100 @@ class Workspace:
                 )
             self.store.object_update("artifact_job", owner, record)
 
+    def request_visual_check(self, owner, identity):
+        with self.store.mutations:
+            return self._request_visual_check(owner, identity)
+
+    def _request_visual_check(self, owner, identity):
+        media = self.store.object_get("media", identity, owner)
+        self.images.preview(owner, identity, "preview")
+        if self.options.service_config is None:
+            raise DocQAError(
+                "VISION_NOT_CONFIGURED", "Visual checking requires a Service vision configuration"
+            )
+        vision = load_service_options(self.options.service_config).parse.vision
+        if vision.mode != "http":
+            raise DocQAError("VISION_NOT_CONFIGURED", "Configure a vision model first")
+        profile = sha256(vision.model_dump_json().encode()).hexdigest()
+        for record in self.store.objects("visual_check", owner, 100):
+            if (
+                record["media_id"] == identity
+                and record["profile"] == profile
+                and record["state"] in {"queued", "running", "ready"}
+            ):
+                return record
+        if (
+            sum(
+                r["state"] in {"queued", "running"}
+                for r in self.store.objects("visual_check", None, 100)
+            )
+            >= 4
+        ):
+            raise DocQAError("WEB_QUEUE_FULL", "Visual check queue is full")
+        return self.store.object_put(
+            "visual_check",
+            owner,
+            {
+                "id": uuid4().hex,
+                "media_id": identity,
+                "answer_id": media["answer_id"],
+                "profile": profile,
+                "state": "queued",
+                "created_at": time.time(),
+            },
+        )
+
+    def process_visual_checks(self):
+        for record in self.store.objects("visual_check", None, 100):
+            if record["state"] != "queued":
+                continue
+            with self.manager.store.transaction() as db:
+                row = db.execute(
+                    "SELECT owner FROM ws_objects WHERE kind='visual_check' AND id=?",
+                    (record["id"],),
+                ).fetchone()
+            if row is None:
+                continue
+            owner = row[0]
+            record["state"] = "running"
+            if not self.store.object_update("visual_check", owner, record):
+                continue
+            try:
+                from docqa.web.visual import isolated_check
+
+                media = self.store.object_get("media", record["media_id"], owner)
+                job = self.manager.store.by_answer(record["answer_id"], owner)
+                answer = self.manager.answer(job)
+                citation = next(
+                    c for c in answer.citations if c.citation_id == media["citation_id"]
+                )
+                claims = [
+                    {"claim_id": c.claim_id, "text": c.text}
+                    for c in answer.claims
+                    if c.claim_id in citation.claim_ids
+                ]
+                vision = load_service_options(self.options.service_config).parse.vision
+                if sha256(vision.model_dump_json().encode()).hexdigest() != record["profile"]:
+                    raise DocQAError(
+                        "VISION_CONFIG_CHANGED", "Vision configuration changed; request a new check"
+                    )
+                with tempfile.TemporaryDirectory(prefix="docqa-visual-") as directory:
+                    image = Path(directory) / "source.png"
+                    image.write_bytes(self.images.preview(owner, record["media_id"], "preview"))
+                    record["result"] = isolated_check(
+                        image, answer.question, claims, vision, cancelled=self.shutdown.is_set
+                    )
+                record["state"] = "ready"
+            except Exception as error:
+                record.update(
+                    state="failed",
+                    error_code=error.code
+                    if isinstance(error, DocQAError)
+                    else "VISION_CHECK_FAILED",
+                )
+            self.store.object_update("visual_check", owner, record)
+            break
+
     def process_exports(self):
         with self.manager.store.transaction() as db:
             rows = [
@@ -682,3 +859,11 @@ class Workspace:
                 self.worker_error = (
                     error.code if isinstance(error, DocQAError) else "WORKSPACE_WORKER_FAILED"
                 )
+
+    def _visual_loop(self):
+        while not self.shutdown.wait(0.35):
+            try:
+                self.process_visual_checks()
+            except (DocQAError, OSError, ValueError):
+                # Durable jobs recover on restart; avoid killing unrelated maintenance.
+                continue

@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from hashlib import sha256
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -17,19 +18,26 @@ def encoded(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def submission_data(value):
+    data = value.model_dump(mode="json")
+    if value.mode == "retrieval":
+        data.pop("mode", None)  # Preserve fingerprints of existing retrieval requests.
+    return data
+
+
 class WorkspaceStore:
     def __init__(self, tasks):
         self.tasks = tasks
         self.mutations = threading.RLock()
-        with sqlite3.connect(_io_path(tasks.path)) as db:
+        with closing(sqlite3.connect(_io_path(tasks.path))) as db:
             present = db.execute(
                 "SELECT 1 FROM sqlite_master WHERE name='ws_conversations'"
             ).fetchone()
             if not present and db.execute("SELECT count(*) FROM jobs").fetchone()[0]:
                 backup = _io_path(tasks.root / "backups")
                 backup.mkdir(exist_ok=True)
-                with sqlite3.connect(
-                    backup / ("before-workspace-" + uuid4().hex + ".sqlite")
+                with closing(
+                    sqlite3.connect(backup / ("before-workspace-" + uuid4().hex + ".sqlite"))
                 ) as target:
                     db.backup(target)
         with tasks.transaction() as db:
@@ -197,7 +205,7 @@ class WorkspaceStore:
 
     def previous_submission(self, identity, owner, value):
         """Resolve retries before catalog validation, including after an upgrade."""
-        fingerprint = sha256(encoded(value.model_dump(mode="json")).encode()).hexdigest()
+        fingerprint = sha256(encoded(submission_data(value)).encode()).hexdigest()
         with self.tasks.transaction() as db:
             self.conversation_row(db, identity, owner)
             row = db.execute(
@@ -208,9 +216,11 @@ class WorkspaceStore:
             raise DocQAError("IDEMPOTENCY_CONFLICT", "Request key was reused for different input")
         return row["job_id"] if row else None
 
-    def submit(self, identity, owner, value, generation, document_ids):
+    def submit(
+        self, identity, owner, value, generation, document_ids, *, chat_history_override=None
+    ):
         request_key = value.client_request_id
-        data = value.model_dump(mode="json")
+        data = submission_data(value)
         fingerprint = sha256(encoded(data).encode()).hexdigest()
         now, job_id = time.time(), uuid4().hex
         with self.tasks.transaction() as db:
@@ -225,7 +235,11 @@ class WorkspaceStore:
                         "IDEMPOTENCY_CONFLICT", "Request key was reused for different input"
                     )
                 return previous["job_id"]
-            if conversation["generation_id"] and conversation["generation_id"] != generation:
+            if (
+                value.mode != "chat"
+                and conversation["generation_id"]
+                and conversation["generation_id"] != generation
+            ):
                 raise DocQAError("CONVERSATION_CHANGED", "Conversation version changed")
             if db.execute(
                 "SELECT 1 FROM ws_messages m JOIN jobs j ON j.job_id=m.job_id WHERE m.conversation=? AND j.state IN ('queued','running')",
@@ -242,7 +256,7 @@ class WorkspaceStore:
             history = [
                 row[0]
                 for row in db.execute(
-                    "SELECT content FROM ws_messages WHERE conversation=? AND role='user' ORDER BY created DESC LIMIT 4",
+                    "SELECT m.content FROM ws_messages m JOIN jobs j ON j.job_id=m.job_id WHERE m.conversation=? AND m.role='user' AND COALESCE(json_extract(j.payload,'$.mode'),'retrieval')='retrieval' ORDER BY m.created DESC LIMIT 4",
                     (identity,),
                 )
             ][::-1]
@@ -260,7 +274,41 @@ class WorkspaceStore:
                 "categories": value.categories,
                 "doc_types": value.doc_types,
                 "generation_id": generation,
+                "interaction_mode": value.mode,
             }
+            if value.mode == "chat":
+                turns, used = [], 0
+                rows = db.execute(
+                    "SELECT j.payload,j.result FROM ws_messages m JOIN jobs j ON j.job_id=m.job_id WHERE m.conversation=? AND m.role='user' AND j.owner_id=? AND j.state='succeeded' AND json_extract(j.payload,'$.mode')='chat' ORDER BY m.created DESC LIMIT 8",
+                    (identity, owner),
+                ).fetchall()
+                for row in rows:
+                    prior, result = json.loads(row["payload"]), json.loads(row["result"])
+                    pair = [
+                        {"role": "user", "content": prior["question"]},
+                        {"role": "assistant", "content": result["chat"]["content"]},
+                    ]
+                    size = sum(len(m["content"].encode("utf-8")) for m in pair)
+                    if used + size > 24000:
+                        break
+                    turns.insert(0, pair)
+                    used += size
+                payload = {
+                    "mode": "chat",
+                    "question": value.question,
+                    "generation_id": None,
+                    "chat_history": [message for pair in turns for message in pair],
+                }
+                if chat_history_override is not None:
+                    payload["chat_history"] = chat_history_override
+                scope = {
+                    "mode": "all",
+                    "interaction_mode": "chat",
+                    "generation_id": None,
+                    "doc_ids": None,
+                    "categories": None,
+                    "doc_types": None,
+                }
             db.execute(
                 "INSERT INTO jobs(job_id,owner_id,state,payload,stage,created_at,updated_at) VALUES(?,?,'queued',?,'queued',?,?)",
                 (job_id, owner, encoded(payload), now, now),
@@ -285,7 +333,12 @@ class WorkspaceStore:
             )
             db.execute(
                 "UPDATE ws_conversations SET title=?,generation_id=?,updated=?,version=version+1 WHERE id=?",
-                (title, generation, now, identity),
+                (
+                    title,
+                    conversation["generation_id"] if value.mode == "chat" else generation,
+                    now,
+                    identity,
+                ),
             )
         return job_id
 

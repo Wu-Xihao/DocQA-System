@@ -82,7 +82,13 @@ def _status(code):
         return 404
     if code == "WEB_QUEUE_FULL":
         return 429
-    if code in {"INVALID_REQUEST", "INVALID_PLAN", "INVALID_CONFIG", "INVALID_GENERATION"}:
+    if code in {
+        "INVALID_REQUEST",
+        "INVALID_PLAN",
+        "INVALID_CONFIG",
+        "INVALID_GENERATION",
+        "ARTIFACT_PLAN_INVALID",
+    }:
         return 422
     if code in {
         "PROFILE_MISMATCH",
@@ -94,6 +100,7 @@ def _status(code):
         "SCOPE_EMPTY",
         "ARTIFACT_RELATIONS_MISSING",
         "ARTIFACT_EVIDENCE_MISSING",
+        "ARTIFACT_KEYWORDS_MISSING",
         "EXPORT_NOT_READY",
         "UPLOAD_ALREADY_COMMITTED",
     }:
@@ -213,12 +220,16 @@ def create_app(options: WebOptions | None = None, *, runner_factory=None):
         value.update(
             question=job["payload"]["question"], generation_id=job["payload"]["generation_id"]
         )
-        value["answer_id"] = job["result"]["answer_id"] if job["result"] else None
+        value["mode"] = job["payload"].get("mode", "retrieval")
+        value["answer_id"] = job["result"].get("answer_id") if job["result"] else None
+        value["chat_id"] = job["result"].get("chat_id") if job["result"] else None
         value["answer_status"] = job["result"]["status"] if job["result"] else None
         value["retrieval_preview"] = manager.retrieval_preview(job)
+        value["chat_preview"] = manager.chat_preview(job)
         if full:
             result = manager.answer(job)
             value["answer"] = web_answer(result) if result else None
+            value["chat"] = manager.chat(job)
         return value
 
     @app.get("/")

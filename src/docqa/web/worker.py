@@ -52,10 +52,11 @@ def managed_writer(envelope):
         yield
 
 
-def main() -> int:
+def main(raw=None, *, persistent=False) -> int:
     protocol_output = sys.stdout
     try:
-        raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+        if raw is None:
+            raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
         if len(raw) > MAX_INPUT_BYTES:
             raise DocQAError("RUNNER_INPUT_LIMIT", "Headless Agent input exceeds its byte limit")
         try:
@@ -70,6 +71,10 @@ def main() -> int:
         except (ValidationError, ValueError, TypeError, UnicodeError) as exc:
             raise DocQAError("INVALID_REQUEST", "Invalid headless Agent input") from exc
         request = envelope.request
+
+        def stage(value):
+            label = envelope.job_id + ":" + value if persistent else value
+            print("DOCQA_STAGE:" + label, file=sys.stderr, flush=True)
 
         def preview(items):
             rows, seen = [], set()
@@ -88,7 +93,23 @@ def main() -> int:
         # Native dependencies sometimes print diagnostics; stdout is reserved
         # for the one-line result receipt, and all stderr stays private.
         with managed_writer(envelope), contextlib.redirect_stdout(sys.stderr):
-            print("DOCQA_STAGE:running", file=sys.stderr, flush=True)
+            stage("running")
+            if request.mode == "chat":
+                from docqa.web.chat import direct_chat
+
+                stage("composing")
+                result = direct_chat(
+                    envelope.job_id, request, envelope.options, envelope.agent_state
+                )
+                verify_saved_result(
+                    Path(envelope.index),
+                    Path(envelope.agent_state),
+                    envelope.job_id,
+                    request,
+                    result,
+                )
+                print(json.dumps(result, separators=(",", ":")), file=protocol_output, flush=True)
+                return 0
             answer = answer_question(
                 envelope.index,
                 request.question,
@@ -102,7 +123,7 @@ def main() -> int:
                 output_format=request.output_format,
                 use_planner=request.use_planner,
                 context_questions=request.context_questions,
-                progress=lambda stage: print(f"DOCQA_STAGE:{stage}", file=sys.stderr, flush=True),
+                progress=stage,
                 evidence_preview=preview,
             )
             result = {
@@ -113,7 +134,7 @@ def main() -> int:
             verify_saved_result(
                 Path(envelope.index), Path(envelope.agent_state), envelope.job_id, request, result
             )
-            print("DOCQA_STAGE:complete", file=sys.stderr, flush=True)
+            stage("complete")
         print(json.dumps(result, separators=(",", ":")), file=protocol_output, flush=True)
         return 0
     except Exception as exc:
@@ -129,4 +150,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if sys.argv[1:] == ["--persistent"]:
+        while raw := sys.stdin.buffer.readline(MAX_INPUT_BYTES + 2):
+            if len(raw) > MAX_INPUT_BYTES + 1:
+                raise SystemExit(4)
+            main(raw, persistent=True)
+    else:
+        raise SystemExit(main())

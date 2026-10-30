@@ -12,6 +12,8 @@ import typer
 from docqa.cli.agent import answer_app, ask_command, source_app
 from docqa.cli.agent import app as agent_app
 from docqa.cli.docbase import app as docbase_app
+from docqa.cli.maintenance import app as maintenance_app
+from docqa.cli.quality import app as quality_app
 from docqa.cli.service import app as service_app
 from docqa.cli.web import app as web_app
 from docqa.doc2md.config import load_options
@@ -27,6 +29,8 @@ app.add_typer(answer_app, name="answer")
 app.add_typer(source_app, name="source")
 app.add_typer(service_app, name="service")
 app.add_typer(web_app, name="web")
+app.add_typer(quality_app, name="quality")
+app.add_typer(maintenance_app, name="maintenance")
 app.command("ask")(ask_command)
 
 
@@ -79,7 +83,7 @@ def batch_command(
     output: Annotated[Path, typer.Option("--output", "-o")] = Path("runtime/doc2md"),
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
     recursive: Annotated[bool, typer.Option("--recursive/--no-recursive")] = True,
-    types: Annotated[str, typer.Option("--types")] = "pdf,docx,pptx",
+    types: Annotated[str, typer.Option("--types")] = "pdf,docx,pptx,xlsx,csv",
     strict: Annotated[bool, typer.Option("--strict")] = False,
 ):
     """Convert selected types, continuing after a corrupt individual file."""

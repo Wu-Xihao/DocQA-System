@@ -11,20 +11,19 @@ from docqa.doc2md.config import ParseOptions
 from docqa.docbase.config import DocBaseOptions
 from docqa.domain.documents import Contract
 from docqa.domain.errors import DocQAError
+from docqa.domain.formats import NATIVE_FORMATS
+from docqa.domain.formats import normalize_types as normalize_format_types
 
 
 def normalize_types(values):
     if isinstance(values, str):
         values = values.split(",")
-    result = sorted({value.strip().lower().lstrip(".") for value in values})
-    if not result or not set(result).issubset({"pdf", "docx", "pptx", "doc", "ppt"}):
-        raise ValueError("Types must be a nonempty selection of pdf,docx,pptx,doc,ppt")
-    return result
+    return sorted(normalize_format_types(values))
 
 
 class ServiceOptions(Contract):
     allowed_source_roots: list[Path] = Field(default_factory=list)
-    types: list[str] = Field(default_factory=lambda: ["pdf", "docx", "pptx"])
+    types: list[str] = Field(default_factory=lambda: list(NATIVE_FORMATS))
     settle_seconds: float = Field(default=3, ge=0, le=3600, allow_inf_nan=False)
     scan_interval_seconds: float = Field(default=1800, ge=1, le=604800, allow_inf_nan=False)
     missing_confirmations: int = Field(default=2, ge=2, le=100)

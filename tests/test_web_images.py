@@ -238,6 +238,25 @@ def test_image_citation_serves_safe_png_with_scope_and_integrity_checks(image_co
             assert private not in serialized
         assert any(locator["locator_type"] == "docx_object" for locator in public["locators"])
 
+        # VL output follows its exact figure in both galleries; no model call on reads.
+        related = owner.get(f"/api/v1/queries/{answer['answer_id']}/related-images")
+        assert related.status_code == 200, related.text
+        figure = related.json()["items"][0]
+        assert figure["vision"]["observations"] == [DESCRIPTION]
+        assert figure["vision"]["status"] == "ok"
+        assert figure["semantic_state"] == "described"
+        assert "artifact" not in figure and "relative_path" not in figure
+        for url in (
+            citation["resources"]["images_gallery"],
+            f"/api/v1/documents/{citation['doc_id']}/images",
+        ):
+            response = owner.get(url)
+            assert response.status_code == 200, response.text
+            occurrence = next(
+                row for row in response.json()["items"] if row["id"] == figure["figure_id"]
+            )
+            assert occurrence["vision"] == figure["vision"]
+
         # A second signed browser session cannot adopt the owner's known URLs.
         other = TestClient(app, base_url="http://127.0.0.1:8765", raise_server_exceptions=False)
         try:

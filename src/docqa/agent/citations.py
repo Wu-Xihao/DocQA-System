@@ -28,6 +28,12 @@ def validate_draft(draft: AnswerDraft, items, topics=None) -> None:
         raise DocQAError("ANSWER_INVALID", "Claim, conflict and edge identifiers must be unique")
     used = set()
     for claim in draft.claims:
+        if claim.quote_refs:
+            raise DraftValidationError(
+                "CITATION_INVALID",
+                "External drafts require resolved exact quotes",
+                "quote_selection_unresolved",
+            )
         if len(claim.evidence_ids) != len(set(claim.evidence_ids)) or set(claim.quotes) != set(
             claim.evidence_ids
         ):

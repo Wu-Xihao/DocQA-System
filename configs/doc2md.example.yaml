@@ -16,6 +16,7 @@ tesseract_executable: tesseract
 tessdata_dir: null
 ocr_languages: chi_sim+eng
 external_timeout: 120
+image_workers: 2
 analysis_revision: qwen-vision-v1
 vision:
   mode: http
@@ -24,5 +25,5 @@ vision:
   revision: gitee-managed-unpinned
   api_key_env: GITEE_AI_API_KEY
   enable_thinking: false
-  timeout: 120
-  retries: 1
+  timeout: 60
+  retries: 0

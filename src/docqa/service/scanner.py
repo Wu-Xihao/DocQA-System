@@ -14,10 +14,11 @@ from pathlib import Path
 from typing import Iterable
 
 from docqa.domain.errors import DocQAError
+from docqa.domain.formats import ALL_FORMATS, NATIVE_FORMATS
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _HIDDEN = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0x2)
-_TYPES = frozenset({"pdf", "docx", "pptx", "doc", "ppt"})
+_TYPES = frozenset(ALL_FORMATS)
 _CACHE_DIRS = frozenset(
     {
         "__pycache__",
@@ -233,7 +234,7 @@ def scan_file(
     path: str | os.PathLike[str],
     *,
     max_file_bytes: int = 104857600,
-    types: Iterable[str] = ("pdf", "docx", "pptx"),
+    types: Iterable[str] = NATIVE_FORMATS,
     hash_contents: bool = True,
 ) -> ScannedFile:
     """Inspect one source without traversing or hashing its siblings.
@@ -256,7 +257,7 @@ def scan_file(
     except (AttributeError, TypeError) as exc:
         raise DocQAError("INVALID_SCAN_OPTIONS", "types must contain extensions") from exc
     if not extensions or extensions - _TYPES:
-        raise DocQAError("INVALID_SCAN_OPTIONS", "Supported extensions are pdf/docx/pptx/doc/ppt")
+        raise DocQAError("INVALID_SCAN_OPTIONS", "Supported extensions are " + "/".join(ALL_FORMATS))
     selected = canonical_path(path, directory=False)
     if selected.name.startswith("~$") or selected.name.lower().endswith((".tmp", ".part", ".swp")):
         raise DocQAError("SOURCE_NOT_READY", "Temporary/partial source files are excluded")
@@ -273,7 +274,7 @@ def scan_file(
 def scan_directory(
     root: str | os.PathLike[str],
     recursive: bool = True,
-    types: Iterable[str] = ("pdf", "docx", "pptx"),
+    types: Iterable[str] = NATIVE_FORMATS,
     max_files: int = 10000,
     max_file_bytes: int = 104857600,
     hash_contents: bool = True,
@@ -306,7 +307,7 @@ def scan_directory(
     except (AttributeError, TypeError) as exc:
         raise DocQAError("INVALID_SCAN_OPTIONS", "types must contain extensions") from exc
     if not extensions or extensions - _TYPES:
-        raise DocQAError("INVALID_SCAN_OPTIONS", "Supported extensions are pdf/docx/pptx/doc/ppt")
+        raise DocQAError("INVALID_SCAN_OPTIONS", "Supported extensions are " + "/".join(ALL_FORMATS))
     lexical_root = Path(os.path.abspath(os.fspath(root)))
     snapshot = ScanSnapshot(lexical_root)
     try:

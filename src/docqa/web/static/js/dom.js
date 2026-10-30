@@ -34,7 +34,7 @@ export function recallLabel(routes) {
 }
 export const statusNames = {
   answered: "回答已完成",
-  partial: "部分内容有据",
+  partial: "回答已生成",
   insufficient_evidence: "证据不足",
   conflicting_evidence: "来源存在冲突",
   failed: "处理失败",
@@ -79,6 +79,8 @@ export const errorNames = {
   SOURCE_ROOT_OVERLAP:
     "监控目录与已登记目录重叠，请选择原有根目录，或先停用并移除旧监控。",
   SOURCE_ACCESS_DENIED: "此路径不在后台允许的资料目录中。",
+  SOURCE_NOT_FOUND: "目录不存在，请检查文件夹路径及允许目录是否可访问。",
+  SOURCE_NOT_DIRECTORY: "请输入文件夹的完整路径。",
   SOURCE_ROOT_NOT_ALLOWED:
     "此目录不在后台 allowed_source_roots 中，请先在 Service 配置中授权。",
   DELETION_CLEANUP_PENDING: "记录已移除，后端文件仍在清理，将自动重试。",
@@ -86,6 +88,14 @@ export const errorNames = {
   BODY_TOO_LARGE: "文件超过大小限制。",
   UPLOAD_INCOMPLETE: "文件未传输完整，请重试。",
   ARTIFACT_EVIDENCE_MISSING: "当前回答没有可用于生成成果的已支持内容。",
+  ARTIFACT_PLAN_INVALID:
+    "分组编排需要完整保留每个要点，且每个要点只能出现一次。",
+  VISION_NOT_CONFIGURED:
+    "尚未配置独立的视觉模型，请检查 Service 中的 vision 配置。",
+  VISION_CONFIG_CHANGED: "视觉模型配置已变化，请重新发起看图复核。",
+  VISION_CHECK_FAILED: "看图复核未完成，请稍后重试或直接对照原图。",
+  VISION_CHECK_TIMEOUT: "看图复核超过35秒，已停止；可稍后重试。",
+  VISION_CHECK_CANCELLED: "看图复核已取消。",
   ARTIFACT_RELATIONS_MISSING:
     "当前回答还没有通过检查的关系，请先生成关系图回答。",
   MODEL_RESPONSE_INVALID: "模型返回的结构不合格，自动修复后仍未通过。",
@@ -106,6 +116,7 @@ export const errorNames = {
   EXPORT_UNSUPPORTED: "这种成果不支持该导出格式。",
   EXPORT_NOT_READY: "文件仍在生成，请稍后再试。",
   ARTIFACT_TOO_LARGE: "内容过多，请缩小问题范围后导出。",
+  ARTIFACT_KEYWORDS_MISSING: "当前回答中可提取的关键词不足，请先生成内容更完整的文档回答。",
 };
 export function errorText(error) {
   return (
@@ -139,11 +150,6 @@ export function locationText(locators) {
             : "原生文档对象"),
     )
     .join("；");
-}
-export function sourceWarning(answer) {
-  return (answer.warnings || []).some((w) =>
-    w.startsWith("SOURCE_COVERAGE_PARTIAL:"),
-  );
 }
 export function richText(text) {
   const root = el("div", "rich-text");

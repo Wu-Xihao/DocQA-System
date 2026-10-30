@@ -150,6 +150,18 @@ class Service:
                             f"scan:{existing['source_id']}",
                             priority=10,
                         )
+                    elif not set(selected_types) <= set(existing["types"]):
+                        # Re-adding with more formats (e.g. after XLSX/CSV support was
+                        # enabled) widens the policy; it never narrows silently.
+                        existing["types"] = sorted({*existing["types"], *selected_types})
+                        self.registry.put("sources", existing)
+                        self.registry.bump()
+                        self._try_enqueue(
+                            "scan",
+                            {"source_id": existing["source_id"]},
+                            f"scan:{existing['source_id']}",
+                            priority=10,
+                        )
                     return existing
                 if is_within(other, selected) or is_within(selected, other):
                     raise DocQAError(
@@ -589,7 +601,7 @@ class Service:
             "build", {"revision": self.registry.meta("desired_revision", 0)}, "build", priority=100
         )
 
-    def _parse(self, payload):
+    def _parse(self, payload, progress=None):
         doc = self.registry.get("documents", payload["doc_id"])
         target = payload["target_version"]
         source = self.registry.get("sources", doc["source_id"])
@@ -611,8 +623,9 @@ class Service:
             },
         )
         try:
+            extra = {"progress": progress} if self.parse_function is parse_document else {}
             result = self.parse_function(
-                doc["path"], self.parsed, options=options, doc_id=doc["doc_id"]
+                doc["path"], self.parsed, options=options, doc_id=doc["doc_id"], **extra
             )
             ir = DocumentIR.model_validate_json(
                 _io_path(Path(result.artifact_dir) / "document.ir.json").read_bytes()
@@ -677,7 +690,7 @@ class Service:
                 )
             yield
 
-    def _build(self):
+    def _build(self, progress=None):
         with self._mutation():
             revision = self.registry.meta("desired_revision", 0)
             self.registry.set_meta("build_attempt_revision", revision)
@@ -723,6 +736,7 @@ class Service:
             replace=True,
             allow_empty=True,
             publication_guard=lambda: self._publication_guard(revision),
+            **({"progress": progress} if self.build_function is build_index else {}),
         )
         with self._mutation():
             self.registry.set_meta("assembled_revision", revision)
@@ -974,13 +988,17 @@ class Service:
             return None
         self.queue.heartbeat(job["job_id"], self.owner)
         started = time.monotonic()
+        def progress(stage, current=None, total=None):
+            self.queue.report_progress(job["job_id"], self.owner, stage, current, total)
         try:
             if job["kind"] == "scan":
                 result = self._scan(job["payload"]["source_id"])
             elif job["kind"] == "parse":
-                result = self._parse(job["payload"])
+                progress("reading")
+                result = self._parse(job["payload"], progress=progress)
             elif job["kind"] == "build":
-                result = self._build()
+                progress("verify_sources")
+                result = self._build(progress=progress)
             else:
                 raise DocQAError("INVALID_REQUEST", "Unknown Service job kind")
             record = self.queue.finish(job["job_id"], self.owner, result)

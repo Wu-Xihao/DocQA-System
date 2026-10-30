@@ -156,7 +156,7 @@ def test_pdf_ruled_table_is_not_duplicated_in_paragraphs(tmp_path):
     paragraphs = " ".join(block.text for block in result.blocks if block.type == "paragraph")
     assert paragraphs == "Table introduction"
     assert "Alpha" not in paragraphs
-    assert result.figures[0].full_page
+    assert not result.figures[0].full_page
     assert not result.figures[0].metadata["needs_ocr"]
     assert [block.order for block in result.blocks] == list(range(len(result.blocks)))
 
@@ -190,7 +190,7 @@ def test_pdf_vectors_survive_even_without_embedded_images(tmp_path):
     assert not result.metadata["pages"][0]["image_count"]
     assert result.metadata["pages"][0]["vector_object_count"] > 0
     assert len(result.figures) == 1
-    assert result.figures[0].full_page
+    assert not result.figures[0].full_page
     assert result.figures[0].metadata["needs_ocr"]
     assert result.figures[0].original_asset_id is None
 
@@ -379,9 +379,11 @@ def test_pdf_crop_excludes_hidden_text_and_uses_visible_coordinate_basis(tmp_pat
     assert "VISIBLE" in text and "HIDDEN" not in text
     figure = result.figures[0]
     asset = next(asset for asset in result.assets if asset.asset_id == figure.asset_id)
-    expected = (110, 100) if rotation in {0, 180} else (100, 110)
-    assert (asset.width, asset.height) == expected
-    assert figure.locator.bbox == (0.0, 0.0, 1.0, 1.0)
+    page_size = (110, 100) if rotation in {0, 180} else (100, 110)
+    assert asset.width < page_size[0] and asset.height < page_size[1]
+    assert not figure.full_page
+    assert all(0 <= x <= 1 for x in figure.locator.bbox)
+    assert figure.locator.native_ref["bbox_points"]
     for block in result.blocks:
         assert (
             block.locators[0].native_ref["normalized_coordinate_basis"] == "visible_rotated_cropbox"

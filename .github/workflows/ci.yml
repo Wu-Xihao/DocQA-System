@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # Integrity and path handling include Windows-specific code paths.
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install -e . --no-deps
+      - name: Lint
+        run: python -m ruff check src tests scripts
+      - name: Test with coverage
+        # Synthetic data and HTTP mocks only; no model keys are configured here.
+        run: python -m pytest -q --cov=docqa --cov-report=term --cov-report=xml
+      - name: Offline stress smoke
+        run: python scripts/docqa.py quality stress --documents 30 --rows 100 --queries 20 --output runtime/ci-stress
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml

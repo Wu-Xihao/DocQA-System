@@ -29,6 +29,8 @@ class WebOptions(Contract):
     app_name: str = Field(default="DocQA 文档工作台", min_length=1, max_length=80)
     backend: Literal["builtin"] = "builtin"
     max_pending_jobs: int = Field(default=20, ge=1, le=1000)
+    query_workers: int = Field(default=1, ge=1, le=4)
+    reuse_workers: bool = False
     max_body_bytes: int = Field(default=65536, ge=1024, le=1048576)
     max_asset_bytes: int = Field(default=33554432, ge=1024, le=268435456)
     runner_timeout_seconds: float = Field(default=150, gt=0, le=3600, allow_inf_nan=False)

@@ -1,8 +1,24 @@
 // Local, consistent stroke icons: no font download or external icon service.
 const paths = {
+  chat: ["M4 4h16v12H9l-5 4Z", "M8 8h8", "M8 12h5"],
   image: ["M3 4h18v16H3Z", "m3 16 5-5 4 4 3-3 6 6", "M16 8h.01"],
   copy: ["M8 8h12v13H8Z", "M16 8V3H3v13h5"],
   folder: ["M3 5h7l2 3h9v12H3Z"],
+  "folder-sync": [
+    "M21 10V8h-9l-2-3H3v15h7",
+    "M21 16a5 5 0 0 0-8-2",
+    "M13 10v4h4",
+    "M13 18a5 5 0 0 0 8 2",
+    "M21 22v-4h-4",
+  ],
+  database: [
+    "M20 6c0 2-4 3-8 3S4 8 4 6s4-3 8-3 8 1 8 3Z",
+    "M4 6v12c0 2 4 3 8 3s8-1 8-3V6",
+    "M4 12c0 2 4 3 8 3s8-1 8-3",
+  ],
+  info: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z", "M12 11v6", "M12 7h.01"],
+  plus: ["M12 5v14", "M5 12h14"],
+  more: ["M5 12h.01", "M12 12h.01", "M19 12h.01"],
   history: ["M3 11a9 9 0 1 1 2 7", "M3 5v6h6", "M12 7v5l3 2"],
   source: ["M8 4H5v16h3", "M16 4h3v16h-3", "M10 9l2-1v8", "M10 16h4"],
   report: [
@@ -27,6 +43,7 @@ const paths = {
     "M4 12v7h3",
   ],
   slides: ["M3 4h18v13H3Z", "M8 22l4-5 4 5", "M7 8h10", "M7 12h6"],
+  wordcloud: ["M6 18a4 4 0 0 1-1-7.9A7 7 0 0 1 18 8a5 5 0 0 1 0 10Z", "M8 11h5", "M7 14h3", "M13 14h4"],
   compare: ["M4 7h16l-4-4", "M20 17H4l4 4", "M20 7l-4 4", "M4 17l4-4"],
   "panel-left": ["M3 4h18v16H3Z", "M9 4v16", "M5.5 8h1", "M5.5 12h1"],
   "panel-right": ["M3 4h18v16H3Z", "M15 4v16", "M17.5 8h1", "M17.5 12h1"],
@@ -34,6 +51,7 @@ const paths = {
   reset: ["M4 8h16", "M7 5 4 8l3 3", "M17 13l3 3-3 3", "M4 16h16"],
   upload: ["M12 16V3", "M7 8l5-5 5 5", "M4 15v6h16v-6"],
   search: ["M11 3a8 8 0 1 0 0 16 8 8 0 0 0 0-16Z", "M17 17l4 4"],
+  chart: ["M4 20V11", "M10 20V5", "M16 20v-6", "M3 20h18", "M20 8l-3-3"],
   refresh: ["M20 10a8 8 0 1 0-2 8", "M20 4v6h-6"],
   edit: ["m15 4 5 5", "M4 20l5-1L21 7l-5-5L4 14Z"],
   attach: ["m8 13 7-7a3 3 0 0 1 4 4l-9 9a5 5 0 0 1-7-7l10-10"],

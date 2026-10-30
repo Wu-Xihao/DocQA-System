@@ -19,11 +19,12 @@ import time
 from pathlib import Path
 from typing import Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from docqa.agent.config import AgentOptions
 from docqa.agent.sessions import SessionStore
 from docqa.domain.errors import DocQAError
+from docqa.web.chat import ChatMessage, load_chat, request_digest
 
 MAX_INPUT_BYTES = 1_048_576
 _ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -53,13 +54,39 @@ class WorkerRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
     question: str = Field(min_length=1, max_length=4000)
-    generation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    mode: Literal["retrieval", "chat"] = "retrieval"
+    generation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    chat_history: list[ChatMessage] = Field(default_factory=list, max_length=16)
     categories: list[str] | None = Field(default=None, max_length=256)
     doc_ids: list[str] | None = Field(default=None, max_length=10000)
     topics: list[str] | None = Field(default=None, min_length=1, max_length=12)
     output_format: Literal["markdown", "table", "mermaid"] = "markdown"
     use_planner: bool = False
     context_questions: list[str] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode="after")
+    def mode_boundary(self):
+        if self.mode == "retrieval":
+            if self.generation_id is None or self.chat_history:
+                raise ValueError("Retrieval requires a generation and no direct chat history")
+        elif (
+            self.generation_id is not None
+            or self.categories is not None
+            or self.doc_ids is not None
+            or self.topics is not None
+            or self.context_questions
+            or self.output_format != "markdown"
+            or self.use_planner
+        ):
+            raise ValueError("Ordinary chat must not carry retrieval scope")
+        if len(self.chat_history) % 2 or any(
+            message.role != ("user" if i % 2 == 0 else "assistant")
+            for i, message in enumerate(self.chat_history)
+        ):
+            raise ValueError("History must consist of complete user/assistant turns")
+        if sum(len(m.content.encode("utf-8")) for m in self.chat_history) > 24000:
+            raise ValueError("Conversation history exceeds budget")
+        return self
 
     @field_validator("context_questions")
     @classmethod
@@ -133,11 +160,12 @@ def _result(raw: bytes, returncode: int) -> dict[str, str]:
                 raise ValueError("Invalid error code")
             # Never propagate child exception text, endpoint URLs, or stdout.
             raise DocQAError(error["code"], "The headless Agent could not complete this request")
-        if set(result) != {"answer_id", "session_id", "status"}:
+        chat = set(result) == {"chat_id", "status"}
+        if not chat and set(result) != {"answer_id", "session_id", "status"}:
             raise ValueError("Unexpected result fields")
         if any(
             not isinstance(result[key], str) or not _ID.fullmatch(result[key])
-            for key in ("answer_id", "session_id")
+            for key in (("chat_id",) if chat else ("answer_id", "session_id"))
         ):
             raise ValueError("Invalid result identity")
         if result["status"] not in _STATUS:
@@ -153,6 +181,20 @@ def verify_saved_result(
     index: Path, agent_state: Path, job_id: str, request: WorkerRequest, result: dict
 ) -> dict[str, str]:
     """A small stdout receipt cannot substitute for a saved and grounded answer."""
+    if request.mode == "chat":
+        saved = load_chat(agent_state)
+        if (
+            set(result) != {"chat_id", "status"}
+            or result["status"] != "answered"
+            or saved.chat_id != result["chat_id"]
+            or saved.job_id != job_id
+            or saved.question != request.question
+            or saved.request_sha256 != request_digest(request)
+        ):
+            raise DocQAError("RUNNER_RESULT_MISMATCH", "Saved chat differs from its request")
+        return result
+    if set(result) != {"answer_id", "session_id", "status"}:
+        raise DocQAError("RUNNER_RESULT_MISMATCH", "Retrieval cannot publish a chat receipt")
     store = SessionStore(agent_state)
     answer = store.load_answer(result["answer_id"])
     session = store.get(result["session_id"], caller="web:" + job_id, require_open=False)
@@ -241,7 +283,7 @@ class HeadlessRunner:
         self.timeout_seconds = timeout_seconds
         self.max_output_bytes = max_output_bytes
 
-    def _environment(self):
+    def _environment(self, *, chat_only=False):
         keys = {"SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "SYSTEMDRIVE", "TEMP", "TMP", "PATH"}
         environment = {key: value for key, value in os.environ.items() if key.upper() in keys}
         environment.update(
@@ -258,6 +300,8 @@ class HeadlessRunner:
             self.options.retrieval.sparse,
             self.options.retrieval.reranker,
         ]
+        if chat_only:
+            services = [self.options.generator]
         reserved = keys | {
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -313,7 +357,7 @@ class HeadlessRunner:
             raise DocQAError("RUNNER_INPUT_LIMIT", "Headless Agent input exceeds its byte limit")
         if cancelled():
             raise DocQAError("WEB_JOB_CANCELLED", "Question was cancelled")
-        environment = self._environment()
+        environment = self._environment(chat_only=selected.mode == "chat")
         directory = self.runs / job_id
         try:
             self.runs.mkdir(parents=True, exist_ok=True)
@@ -340,6 +384,7 @@ class HeadlessRunner:
             raise DocQAError("RUNNER_START_FAILED", "Cannot start the headless Agent") from exc
         capture = _Capture(self.max_output_bytes)
         started = time.monotonic()
+        started_at = time.time()
         deadline = started + self.timeout_seconds
         stages, failure, answer_status = [], None, None
 
@@ -444,6 +489,7 @@ class HeadlessRunner:
                     json.dumps(
                         {
                             "job_id": job_id,
+                            "started_at": started_at,
                             "elapsed_seconds": round(time.monotonic() - started, 3),
                             "timeout_seconds": self.timeout_seconds,
                             "error_code": failure,

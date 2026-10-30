@@ -8,6 +8,8 @@ from pydantic import Field, field_validator, model_validator
 
 from docqa.domain.answers import OutputFormat
 from docqa.domain.documents import Contract
+from docqa.domain.formats import ALL_FORMATS
+from docqa.domain.study import StudyPlan
 
 
 class QuestionRequest(Contract):
@@ -16,15 +18,15 @@ class QuestionRequest(Contract):
     doc_ids: list[str] | None = Field(default=None, max_length=1000)
     topics: list[str] | None = Field(default=None, min_length=1, max_length=12)
     output_format: OutputFormat = "markdown"
-    doc_types: list[Literal["pdf", "docx", "pptx"]] | None = Field(
-        default=None, min_length=1, max_length=3
-    )
+    doc_types: list[str] | None = Field(default=None, min_length=1, max_length=len(ALL_FORMATS))
 
     @field_validator("doc_types")
     @classmethod
     def unique_types(cls, value):
         if value is not None and len(value) != len(set(value)):
             raise ValueError("Document types must be distinct")
+        if value is not None and not set(value) <= set(ALL_FORMATS):
+            raise ValueError("Unknown document type")
         return value
 
     @field_validator("question")
@@ -51,11 +53,14 @@ class QuestionRequest(Contract):
 
 
 class MessageRequest(QuestionRequest):
+    mode: Literal["retrieval", "chat"] = "retrieval"
     client_request_id: str = Field(pattern=r"^[a-zA-Z0-9_-]{16,80}$")
     scope_mode: Literal["all", "selected"] = "all"
 
     @model_validator(mode="after")
     def explicit_scope(self):
+        if self.mode == "chat":
+            return self
         if self.scope_mode == "selected" and not self.doc_ids:
             raise ValueError("Selected scope cannot be empty")
         if self.doc_ids is not None and not self.doc_ids:
@@ -94,5 +99,10 @@ class UploadCreate(Contract):
 class ArtifactCreate(Contract):
     conversation_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     answer_id: str = Field(pattern=r"^[a-f0-9]{32}$")
-    kind: Literal["table", "relation", "mindmap", "report", "slides"]
+    kind: Literal["table", "relation", "mindmap", "report", "slides", "wordcloud"]
     title: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+class ArtifactEdit(Contract):
+    title: str = Field(min_length=1, max_length=100)
+    plan: StudyPlan | None = None

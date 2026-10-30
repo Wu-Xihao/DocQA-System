@@ -28,6 +28,7 @@ class ChatServiceOptions(Contract):
     max_response_bytes: int = Field(default=131072, ge=128, le=16_777_216)
     max_output_tokens: int = Field(default=4096, ge=128, le=32768)
     compact_evidence: bool = False
+    stream: bool = False  # Ordinary chat only; RAG drafts remain private JSON tasks.
 
     @field_validator("api_key_env")
     @classmethod
@@ -49,7 +50,7 @@ class AgentOptions(Contract):
     rerank_top_n: int = Field(default=50, ge=1, le=10000)
     max_evidence_bytes: int = Field(default=24000, ge=1000, le=4_194_304)
     initial_evidence_fraction: float = Field(default=1, gt=0, le=1, allow_inf_nan=False)
-    max_output_bytes: int = Field(default=12000, ge=256, le=1_048_576)
+    max_output_bytes: int = Field(default=24000, ge=256, le=1_048_576)
     deadline_seconds: float = Field(default=120, gt=0, le=3600, allow_inf_nan=False)
     finalization_reserve_seconds: float = Field(default=0, ge=0, le=600, allow_inf_nan=False)
     session_ttl_seconds: int = Field(default=3600, ge=30, le=604800)

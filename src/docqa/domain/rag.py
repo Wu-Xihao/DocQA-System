@@ -6,7 +6,7 @@ import json
 from hashlib import sha256
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, JsonValue, model_validator
 
 from docqa.domain.documents import Contract, SourceLocator
 
@@ -127,7 +127,7 @@ class QueryResult(Contract):
     production_ready: bool
     retrieval_mode: str
     retrieval_profile_id: str
-    applied_filter: dict[str, list[str] | None]
+    applied_filter: dict[str, JsonValue]
     hits: list[RetrievalHit]
     routes: dict[str, RouteResult]
     candidate_count: int = Field(ge=0)

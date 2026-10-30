@@ -2,6 +2,7 @@
 mode: http
 combine_assessment_and_compose: true
 generator:
+  max_output_tokens: 8192
   endpoint: https://api.deepseek.com/chat/completions
   model: deepseek-flash
   revision: provider-managed-unpinned
@@ -26,7 +27,7 @@ max_candidates: 100
 rerank_top_n: 30
 max_evidence_bytes: 40000
 initial_evidence_fraction: 0.75
-max_output_bytes: 12000
+max_output_bytes: 24000
 max_model_calls: 12
 deadline_seconds: 90
 finalization_reserve_seconds: 25

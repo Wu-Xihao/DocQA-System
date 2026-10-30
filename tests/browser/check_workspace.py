@@ -99,6 +99,7 @@ with sync_playwright() as playwright:
         checks.append(f"{width}px drawers and file chooser")
     page.set_viewport_size({"width": 1440, "height": 1000})
     page.locator("#new-chat").click()
+    page.locator("#scope-section > summary").click()
     page.locator("#select-none").click()
     expect(page.locator("#ask-button")).to_be_disabled()
     page.locator("#select-all").click()

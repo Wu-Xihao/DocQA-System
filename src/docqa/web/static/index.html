@@ -40,6 +40,22 @@
       >
       <div class="top-actions">
         <button
+          id="open-search"
+          class="icon-button panel-toggle"
+          title="片段检索：直接查看检索命中的原文片段"
+          aria-label="打开片段检索"
+        >
+          <span data-icon="search" aria-hidden="true"></span
+          ><span>检索</span></button
+        ><button
+          id="open-stats"
+          class="icon-button panel-toggle"
+          title="知识库统计面板"
+          aria-label="打开知识库统计面板"
+        >
+          <span data-icon="chart" aria-hidden="true"></span
+          ><span>统计</span></button
+        ><button
           id="reset-layout"
           class="icon-button"
           title="恢复面板宽度"
@@ -92,7 +108,7 @@
             <span>＋</span>新建对话<kbd>Ctrl N</kbd>
           </button>
         </div>
-        <details class="sidebar-section" id="documents-section" open>
+        <details class="sidebar-section" id="documents-section" name="sidebar-sections" open>
           <summary>
             <span
               ><span
@@ -133,12 +149,12 @@
             >
               <span class="upload-symbol">↥</span><strong>添加研究资料</strong
               ><span>点击选择，或拖拽文件至此</span
-              ><small>PDF、Word、PPT · 单份最高 100 MB</small>
+              ><small>PDF、Word、PPT、Excel、CSV · 单份最高 100 MB</small>
             </div>
             <input
               id="file-input"
               type="file"
-              accept=".pdf,.docx,.pptx"
+              accept=".pdf,.docx,.pptx,.xlsx,.csv"
               multiple
               hidden
             />
@@ -158,7 +174,15 @@
               id="folder-upload-status"
               class="field-help"
               aria-live="polite"
+              hidden
             ></p>
+            <progress
+              id="folder-upload-progress"
+              max="1"
+              value="0"
+              aria-label="资料处理进度（按文件完成数量）"
+              hidden
+            ></progress>
             <div
               id="uploads-list"
               class="uploads-list"
@@ -177,7 +201,7 @@
             </div>
           </div>
         </details>
-        <details class="sidebar-section" id="scope-section" open>
+        <details class="sidebar-section" id="scope-section" name="sidebar-sections">
           <summary>
             <span
               ><span
@@ -208,6 +232,14 @@
                   ><input type="checkbox" data-doc-type="pdf" checked />
                   PDF</label
                 >
+                <label
+                  ><input type="checkbox" data-doc-type="xlsx" checked />
+                  XLSX</label
+                >
+                <label
+                  ><input type="checkbox" data-doc-type="csv" checked />
+                  CSV</label
+                >
               </div>
             </fieldset>
             <label class="field-label" for="category-select">资料分类</label
@@ -223,67 +255,19 @@
             </p>
           </div>
         </details>
-        <details class="sidebar-section" id="maintenance-section">
-          <summary><span>目录监控与维护</span></summary>
-          <div class="section-body">
-            <p class="field-help">
-              登记服务器本机目录，持续检查新增和修改的文档。浏览器文件夹上传为一次性导入。
-            </p>
-            <p id="watch-allowed" class="field-help"></p>
-            <label class="field-label" for="watch-path">本机目录绝对路径</label>
-            <input
-              id="watch-path"
-              class="watch-input"
-              placeholder="例如 E:\资料库\项目资料"
-            />
-            <div class="scope-actions">
-              <label
-                ><input type="checkbox" data-watch-type="docx" checked />
-                DOCX</label
-              >
-              <label
-                ><input type="checkbox" data-watch-type="pptx" checked />
-                PPTX</label
-              >
-              <label
-                ><input type="checkbox" data-watch-type="pdf" checked />
-                PDF</label
-              >
-            </div>
-            <label
-              ><input id="watch-recursive" type="checkbox" checked />
-              包含子目录</label
-            >
-            <label class="field-label" for="watch-interval"
-              >周期扫描间隔（秒，至少15）</label
-            >
-            <input
-              id="watch-interval"
-              type="number"
-              class="watch-input"
-              min="15"
-              max="604800"
-              value="1800"
-            />
-            <div class="scope-actions">
-              <button id="watch-add" type="button">添加监控</button
-              ><button id="watch-refresh" type="button">刷新</button>
-            </div>
-            <div id="watch-list"></div>
-            <div class="scope-actions">
-              <button id="index-status" type="button">索引状态</button
-              ><button id="index-rebuild" type="button">更新索引</button>
-            </div>
-            <p id="index-status-text" class="field-help"></p>
-          </div>
-        </details>
         <details
           class="sidebar-section history-section"
           id="history-section"
-          open
+          name="sidebar-sections"
         >
           <summary>
-            <span><span class="section-icon">◷</span>聊天记录</span
+            <span
+              ><span
+                class="section-icon"
+                data-icon="history"
+                aria-hidden="true"
+              ></span
+              >聊天记录</span
             ><button
               type="button"
               id="refresh-history"
@@ -311,6 +295,149 @@
             <button id="more-history" class="text-button full-width" hidden>
               加载更多
             </button>
+          </div>
+        </details>
+        <details class="sidebar-section" id="maintenance-section" name="sidebar-sections">
+          <summary>
+            <span
+              ><span
+                class="section-icon"
+                data-icon="folder-sync"
+                aria-hidden="true"
+              ></span
+              >目录监控与维护</span
+            >
+            <span id="watch-count" class="count" hidden>0</span>
+          </summary>
+          <div class="section-body maintenance-body">
+            <div class="maintenance-toolbar">
+              <span class="maintenance-caption">自动同步本机文件夹</span>
+              <button
+                id="watch-refresh"
+                type="button"
+                class="tiny-button"
+                title="刷新监控目录"
+                aria-label="刷新监控目录"
+              >
+                <span data-icon="refresh" aria-hidden="true"></span>
+              </button>
+            </div>
+            <p
+              id="watch-feedback"
+              class="maintenance-feedback"
+              role="status"
+              hidden
+            ></p>
+            <div id="watch-list" aria-label="监控目录列表"></div>
+            <button
+              id="watch-new"
+              type="button"
+              class="maintenance-add"
+              aria-expanded="false"
+              aria-controls="watch-form"
+            >
+              <span data-icon="plus" aria-hidden="true"></span>添加目录
+            </button>
+            <form id="watch-form" class="watch-form" hidden>
+              <label class="field-label" for="watch-path">文件夹路径</label>
+              <input
+                id="watch-path"
+                class="watch-input"
+                placeholder="例如 E:\资料库\项目资料"
+                autocomplete="off"
+                required
+              />
+              <fieldset class="watch-types">
+                <legend>同步类型</legend>
+                <label
+                  ><input
+                    type="checkbox"
+                    data-watch-type="docx"
+                    checked
+                  />DOCX</label
+                >
+                <label
+                  ><input
+                    type="checkbox"
+                    data-watch-type="pptx"
+                    checked
+                  />PPTX</label
+                >
+                <label
+                  ><input
+                    type="checkbox"
+                    data-watch-type="pdf"
+                    checked
+                  />PDF</label
+                >
+                <label
+                  ><input
+                    type="checkbox"
+                    data-watch-type="xlsx"
+                    checked
+                  />XLSX</label
+                >
+                <label
+                  ><input
+                    type="checkbox"
+                    data-watch-type="csv"
+                    checked
+                  />CSV</label
+                >
+              </fieldset>
+              <div class="watch-settings">
+                <label class="watch-recursion"
+                  ><input
+                    id="watch-recursive"
+                    type="checkbox"
+                    checked
+                  />包含子目录</label
+                >
+                <label class="field-label" for="watch-interval"
+                  >扫描间隔（秒）</label
+                >
+                <input
+                  id="watch-interval"
+                  type="number"
+                  class="watch-input"
+                  min="15"
+                  max="604800"
+                  value="1800"
+                  required
+                />
+              </div>
+              <div class="maintenance-form-actions">
+                <button id="watch-cancel" type="button">取消</button
+                ><button
+                  id="watch-add"
+                  type="submit"
+                  class="maintenance-primary"
+                >
+                  开始监控
+                </button>
+              </div>
+            </form>
+            <div class="maintenance-index">
+              <div class="maintenance-toolbar">
+                <strong
+                  ><span data-icon="database" aria-hidden="true"></span
+                  >知识库</strong
+                >
+                <div class="maintenance-index-actions">
+                  <button id="index-status" type="button">状态</button
+                  ><button id="index-rebuild" type="button">更新</button>
+                </div>
+              </div>
+              <p id="index-status-text" class="field-help" role="status"></p>
+            </div>
+            <details class="maintenance-help">
+              <summary>
+                <span data-icon="info" aria-hidden="true"></span>使用说明
+              </summary>
+              <p>监控会持续同步新增和修改的文档；上传文件夹只导入一次。</p>
+              <p>路径需在以下允许目录内，最短扫描间隔为15秒。</p>
+              <div id="watch-allowed"></div>
+            </details>
           </div>
         </details>
         <footer class="sidebar-footer">
@@ -443,6 +570,9 @@
                   aria-label="添加资料附件"
                 >
                   ＋</button
+                ><select id="mode-select" aria-label="聊天模式">
+                  <option value="retrieval" selected>文档检索</option>
+                  <option value="chat">正常聊天</option></select
                 ><span class="composer-scope" id="composer-scope">全部资料</span
                 ><select id="format-select" aria-label="回答形式">
                   <option value="markdown">文字回答</option>
@@ -464,7 +594,7 @@
           </form>
           <p class="composer-footer">
             Enter 发送 · Shift + Enter 换行
-            <span>回答以所选资料为限，请结合来源核对。</span>
+            <span id="mode-help">回答以所选资料为限，请结合来源核对。</span>
           </p>
         </div>
       </main>
@@ -498,8 +628,10 @@
         <section id="tab-sources" class="right-content">
           <div class="right-empty" id="sources-empty">
             <span data-icon="source" aria-hidden="true"></span>
-            <h3>答案背后的依据</h3>
-            <p>点击回答中的引用，<br />在这里查看原文与定位。</p>
+            <h3 id="sources-empty-title">答案背后的依据</h3>
+            <p id="sources-empty-help">
+              点击回答中的引用，<br />在这里查看原文与定位。
+            </p>
           </div>
           <div id="citations-list"></div>
           <div id="source-detail"></div>
@@ -581,7 +713,102 @@
       </header>
       <div class="lightbox-stage" id="lightbox-stage">
         <img id="lightbox-image" alt="" />
+        <aside id="lightbox-analysis" aria-label="图片释义"></aside>
       </div>
+    </dialog>
+    <dialog id="search-dialog" class="tool-dialog" aria-labelledby="search-title">
+      <header class="tool-header">
+        <div>
+          <span class="eyebrow">片段检索 · 三路召回＋重排</span>
+          <h2 id="search-title">检索原文片段</h2>
+        </div>
+        <button class="icon-button" id="close-search" aria-label="关闭片段检索">
+          ×
+        </button>
+      </header>
+      <form id="search-form" class="search-form" autocomplete="off">
+        <div class="search-main">
+          <input
+            id="search-question"
+            type="search"
+            maxlength="2000"
+            required
+            placeholder="输入关键词或问题，如 SD5993 心跳周期"
+            aria-label="检索内容"
+          />
+          <button type="submit" class="primary-button" id="search-submit">
+            检索
+          </button>
+        </div>
+        <details class="search-conditions" open>
+          <summary>组合条件（同类可多选，不同条件同时满足）</summary>
+          <div class="condition-grid">
+            <fieldset>
+              <legend>文档类型</legend>
+              <label><input type="checkbox" data-search-type="pdf" />PDF</label>
+              <label><input type="checkbox" data-search-type="docx" />DOCX</label>
+              <label><input type="checkbox" data-search-type="pptx" />PPTX</label>
+              <label><input type="checkbox" data-search-type="xlsx" />XLSX</label>
+              <label><input type="checkbox" data-search-type="csv" />CSV</label>
+            </fieldset>
+            <fieldset>
+              <legend>内容类型</legend>
+              <label><input type="checkbox" data-search-content="text" />正文</label>
+              <label><input type="checkbox" data-search-content="table" />表格</label>
+              <label><input type="checkbox" data-search-content="figure" />图片</label>
+            </fieldset>
+            <fieldset>
+              <legend>内容来源</legend>
+              <label><input type="checkbox" data-search-origin="native" />原生正文</label>
+              <label><input type="checkbox" data-search-origin="ocr" />OCR 转录</label>
+              <label
+                ><input type="checkbox" data-search-origin="vl_generated" />图片释义</label
+              >
+            </fieldset>
+            <label class="condition-field"
+              >必须包含（空格分隔）<input id="search-must" maxlength="400"
+            /></label>
+            <label class="condition-field"
+              >文件名包含<input id="search-name" maxlength="200"
+            /></label>
+            <label class="condition-field"
+              >章节标题包含<input id="search-section" maxlength="200"
+            /></label>
+            <label class="condition-field narrow"
+              >页/幻灯片 从<input id="search-page-from" type="number" min="1"
+            /></label>
+            <label class="condition-field narrow"
+              >到<input id="search-page-to" type="number" min="1"
+            /></label>
+            <label class="condition-field narrow"
+              >返回条数<select id="search-top-k">
+                <option>5</option>
+                <option selected>8</option>
+                <option>12</option>
+                <option>20</option>
+              </select></label
+            >
+            <label class="condition-check"
+              ><input type="checkbox" id="search-use-scope" checked />沿用左侧资料范围</label
+            >
+          </div>
+        </details>
+      </form>
+      <p id="search-summary" class="search-summary subtle" role="status"></p>
+      <ol id="search-results" class="search-results"></ol>
+    </dialog>
+    <dialog id="stats-dialog" class="tool-dialog" aria-labelledby="stats-title">
+      <header class="tool-header">
+        <div>
+          <span class="eyebrow">知识库统计 · 本机数据</span>
+          <h2 id="stats-title">知识库统计面板</h2>
+        </div>
+        <button class="icon-button" id="refresh-stats" aria-label="刷新统计">↻</button
+        ><button class="icon-button" id="close-stats" aria-label="关闭统计面板">
+          ×
+        </button>
+      </header>
+      <div id="stats-content" class="stats-content"></div>
     </dialog>
     <div id="toast" class="toast" role="status" hidden></div>
   </body>

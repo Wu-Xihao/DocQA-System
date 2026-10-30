@@ -22,9 +22,14 @@ from typing import Any
 import numpy as np
 
 from docqa.domain.errors import DocQAError
-from docqa.integrity import VerifiedCache, tree_stamp
+from docqa.integrity import VerifiedCache, subtree_stamp, tree_stamp
 
-_VERIFIED_GENERATIONS = VerifiedCache()
+_VERIFIED_GENERATIONS = VerifiedCache(max_bytes=128 * 1024 * 1024, serialized=True)
+# Validated chunks and postings are never mutated after loading, so cache hits
+# share them instead of unpickling ~100k pydantic objects per query. Only the
+# small mutable metadata (members/profiles/manifest) is copied per caller.
+# Entries live exactly as long as the matching _VERIFIED_GENERATIONS entry.
+_SHARED_PAYLOADS: dict = {}
 
 SCHEMA = "docqa.generation.v1"
 REQUIRED_FILES = {
@@ -531,36 +536,48 @@ def load_generation(
     with _VERIFIED_GENERATIONS.guard(key):
         before = tree_stamp(directory)
         cached = _VERIFIED_GENERATIONS.get(key, before)
+        shared = _SHARED_PAYLOADS.get(key)
+        if cached is not None and (shared is None or shared[0] != before):
+            cached = None
+            _VERIFIED_GENERATIONS.clear()
+            _SHARED_PAYLOADS.clear()
         if cached is not None:
+            cached.chunks, cached.bm25, cached.sparse = list(shared[1]), shared[2], shared[3]
             try:
                 cached.vectors = np.load(
                     directory / "dense/vectors.npy", mmap_mode="r", allow_pickle=False
                 )
-                if tree_stamp(directory) == before:
+                # The whole package matched `before`; only vectors.npy is read
+                # after that check, so re-verifying dense/ closes the race.
+                recheck = tree_stamp(directory / "dense")
+                if recheck is not None and recheck == subtree_stamp(before, "dense/"):
                     return cached
             except (OSError, ValueError):
                 pass  # Changed/unreadable files must go through the full error path.
             cached.close()
             _VERIFIED_GENERATIONS.clear()
+            _SHARED_PAYLOADS.clear()
         generation = _load_generation(directory, verify_sources=verify_sources)
         after = tree_stamp(directory)
         if before is not None and after != before:
             generation.close()
             raise DocQAError("GENERATION_CORRUPT", "Generation changed during validation")
-        size = (
-            sum(
-                (directory / name).stat().st_size
-                for name in (
-                    "catalog.sqlite",
-                    "members.json",
-                    "profiles.json",
-                    "bm25/index.json",
-                    "sparse/index.json",
-                )
-            )
-            * 4
+        # The cache holds a bounded private byte buffer, not a second mutable
+        # copy of the postings. Its retained bytes are measured by put(). Large
+        # sparse JSON no longer silently disables reuse via the old x4 estimate.
+        _VERIFIED_GENERATIONS.put(
+            key, after, replace(generation, vectors=None, chunks=[], bm25={}, sparse={}), 0
         )
-        _VERIFIED_GENERATIONS.put(key, after, replace(generation, vectors=None), size)
+        with _VERIFIED_GENERATIONS.lock:
+            if key in _VERIFIED_GENERATIONS.entries:
+                _SHARED_PAYLOADS[key] = (
+                    after,
+                    tuple(generation.chunks),
+                    generation.bm25,
+                    generation.sparse,
+                )
+            for stale in set(_SHARED_PAYLOADS) - set(_VERIFIED_GENERATIONS.entries):
+                del _SHARED_PAYLOADS[stale]
         return generation
 
 

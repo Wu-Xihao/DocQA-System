@@ -138,7 +138,12 @@ class DraftClaim(Contract):
     topic_ids: list[str] = Field(min_length=1, max_length=12)
     text: str = Field(min_length=1, max_length=4000)
     evidence_ids: list[str] = Field(min_length=1, max_length=20)
-    quotes: dict[str, str]
+    quotes: dict[str, str] = Field(default_factory=dict, max_length=20)
+    quote_refs: dict[str, str] = Field(
+        default_factory=dict,
+        max_length=20,
+        description="Built-in generation: evidence_id -> quote_id from quote_catalog. Leave quotes empty; the server copies the selected exact source. External submissions must provide resolved quotes and leave quote_refs empty.",
+    )
     kind: Literal["fact", "quotation", "inference"] = "fact"
 
 

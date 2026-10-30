@@ -14,9 +14,11 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from docqa.docbase.storage import _io_path, _safe_path
 from docqa.domain.documents import Contract
 from docqa.domain.errors import DocQAError
+from docqa.domain.formats import UPLOAD_FORMATS
 from docqa.web.media import checksum
 from docqa.web.models import (
     ArtifactCreate,
+    ArtifactEdit,
     ConversationCreate,
     ConversationPatch,
     MessageRequest,
@@ -37,15 +39,22 @@ def install_workspace_routes(app, workspace, project_job):
     def owner(request):
         return request.state.client_id
 
+    from docqa.web.search import install as install_search
+
+    install_search(app, workspace, store, owner)
+    from docqa.web.stats import install as install_stats
+
+    install_stats(app, workspace)
+
     @app.get("/api/v1/workspace")
     def workspace_info(request: Request):
         return {
             "uploads_enabled": workspace.enabled,
             "service_mode": workspace.options.service_mode,
             "max_upload_bytes": workspace.options.max_upload_bytes,
-            "upload_types": ["pdf", "docx", "pptx"],
+            "upload_types": list(UPLOAD_FORMATS),
             "worker_error": workspace.worker_error,
-            "artifact_types": ["table", "relation", "mindmap", "report", "slides"],
+            "artifact_types": ["table", "relation", "mindmap", "report", "slides", "wordcloud"],
         }
 
     @app.get("/api/v1/conversations")
@@ -125,19 +134,29 @@ def install_workspace_routes(app, workspace, project_job):
         job = manager.store.get(row["job_id"], owner(request))
         payload = job["payload"]
         value = MessageRequest(
+            mode=payload.get("mode", "retrieval"),
             question=payload["question"],
             categories=payload.get("categories"),
             doc_ids=payload.get("doc_ids"),
             topics=payload.get("topics"),
-            output_format=payload["output_format"],
+            output_format=payload.get("output_format", "markdown"),
             scope_mode="selected" if payload.get("doc_ids") else "all",
             client_request_id=uuid4().hex,
             doc_types=json.loads(row["scope"]).get("doc_types"),
         )
         selected = store.get(row["conversation"], owner(request))
-        if selected["generation_id"] != payload["generation_id"]:
+        if value.mode != "chat" and selected["generation_id"] != payload["generation_id"]:
             raise DocQAError("CONVERSATION_CHANGED", "Original message belongs to an older version")
-        return project_job(workspace.submit(row["conversation"], owner(request), value))
+        return project_job(
+            workspace.submit(
+                row["conversation"],
+                owner(request),
+                value,
+                chat_history_override=payload.get("chat_history", [])
+                if value.mode == "chat"
+                else None,
+            )
+        )
 
     @app.get("/api/v1/documents")
     def documents(request: Request, conversation_id: str | None = None):
@@ -161,7 +180,7 @@ def install_workspace_routes(app, workspace, project_job):
             library_chunks=latest["chunks"],
         )
         catalog["uploads"] = [
-            workspace.public_upload(item) for item in store.objects("upload", owner(request), 200)
+            workspace.public_upload(item) for item in store.objects("upload", owner(request), 1000)
         ]
         return catalog
 
@@ -326,6 +345,10 @@ def install_workspace_routes(app, workspace, project_job):
             status_code=200 if result["state"] == "complete" else 202,
         )
 
+    @app.post("/api/v1/artifacts/{identity}/edits", status_code=201)
+    def edit_artifact(identity: str, value: ArtifactEdit, request: Request):
+        return workspace.edit_artifact(owner(request), identity, value)
+
     @app.post("/api/v1/artifacts/{identity}/regenerate", status_code=202)
     def regenerate_artifact(identity: str, request: Request):
         artifact = workspace.artifact(owner(request), identity)
@@ -394,6 +417,14 @@ def install_workspace_routes(app, workspace, project_job):
             workspace.images.preview(owner(request), identity, variant), media_type="image/png"
         )
 
+    @app.post("/api/v1/media/{identity}/visual-check", status_code=202)
+    def request_visual(identity: str, request: Request):
+        return workspace.request_visual_check(owner(request), identity)
+
+    @app.get("/api/v1/visual-checks/{identity}")
+    def visual_result(identity: str, request: Request):
+        return store.object_get("visual_check", identity, owner(request))
+
     @app.get("/api/v1/events")
     async def events(request: Request, conversation_id: str):
         client = owner(request)
@@ -402,6 +433,7 @@ def install_workspace_routes(app, workspace, project_job):
         async def stream():
             previous = None
             streamed = set()
+            live = {}
             while not await request.is_disconnected():
                 try:
                     records = store.messages(conversation_id, client, limit=200)["items"]
@@ -414,8 +446,72 @@ def install_workspace_routes(app, workspace, project_job):
                     if error.code in {"CONVERSATION_NOT_FOUND", "WEB_JOB_NOT_FOUND"}:
                         return
                     raise
-                # Emit checked answer paragraphs on the transport stream. Raw
-                # model drafts never become public text or clickable citations.
+                if jobs and jobs[-1].get("chat_preview"):
+                    latest = jobs[-1]
+                    preview = latest["chat_preview"]
+                    if preview["content"] != live.get(latest["job_id"]):
+                        live[latest["job_id"]] = preview["content"]
+                        yield (
+                            "event: chat_live\ndata: "
+                            + json.dumps(
+                                {"kind": "chat_live", "job_id": latest["job_id"], "chat": preview},
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+                # Ordinary replies have their own channel and no source claims.
+                # Retrieval below only emits independently checked paragraphs.
+                if jobs and jobs[-1].get("chat_id") and jobs[-1]["job_id"] not in streamed:
+                    latest = jobs[-1]
+                    full = project_job(manager.store.get(latest["job_id"], client), full=True)
+                    chat = full["chat"]
+                    if latest["job_id"] in live:
+                        yield (
+                            "event: chat_done\ndata: "
+                            + json.dumps({"kind": "chat_done", "job": full}, ensure_ascii=False)
+                            + "\n\n"
+                        )
+                        return
+                    yield (
+                        "event: chat_start\ndata: "
+                        + json.dumps(
+                            {
+                                "kind": "chat_start",
+                                "job_id": latest["job_id"],
+                                "chat": {**chat, "content": ""},
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+                    for offset in range(0, len(chat["content"]), 200):
+                        if await request.is_disconnected():
+                            return
+                        try:
+                            manager.store.get(latest["job_id"], client)
+                        except DocQAError:
+                            return
+                        yield (
+                            "event: chat_delta\ndata: "
+                            + json.dumps(
+                                {
+                                    "kind": "chat_delta",
+                                    "job_id": latest["job_id"],
+                                    "text": chat["content"][offset : offset + 200],
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+                        await asyncio.sleep(0)
+                    yield (
+                        "event: chat_done\ndata: "
+                        + json.dumps({"kind": "chat_done", "job": full}, ensure_ascii=False)
+                        + "\n\n"
+                    )
+                    streamed.add(latest["job_id"])
+                    if not any(j["state"] in {"queued", "running"} for j in jobs):
+                        return
                 if (
                     jobs
                     and jobs[-1]["state"] in {"succeeded", "failed"}
@@ -475,7 +571,7 @@ def install_workspace_routes(app, workspace, project_job):
                     previous = payload
                 else:
                     yield ": heartbeat\n\n"
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.15 if jobs and jobs[-1].get("mode") == "chat" else 1)
 
         return StreamingResponse(
             stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"}

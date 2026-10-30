@@ -12,6 +12,8 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from hashlib import sha256
 from importlib import metadata
@@ -28,12 +30,11 @@ from docqa.doc2md.security import inspect_snapshot, io_path, is_within, validate
 from docqa.domain.documents import (
     Block,
     DocumentIR,
-    FigureOccurrence,
     ParseResult,
     ParseWarning,
-    SourceLocator,
 )
 from docqa.domain.errors import DocQAError
+from docqa.domain.formats import ALL_FORMATS, NATIVE_FORMATS
 
 
 def _json(path: Path, value) -> None:
@@ -167,17 +168,9 @@ def _warn(content, code: str, message: str, severity: str = "warning") -> None:
 
 
 def _parse_native(context: ParseContext, fmt: str):
-    if fmt == "pdf":
-        from docqa.doc2md.parsers.pdf import parse_pdf
+    from docqa.doc2md.parsers import parse_native
 
-        return parse_pdf(context)
-    if fmt == "docx":
-        from docqa.doc2md.parsers.docx import parse_docx
-
-        return parse_docx(context)
-    from docqa.doc2md.parsers.pptx import parse_pptx
-
-    return parse_pptx(context)
+    return parse_native(context, fmt)
 
 
 def _add_office_render(content, ctx, renderer, options, preflight):
@@ -197,50 +190,50 @@ def _add_office_render(content, ctx, renderer, options, preflight):
         )
         return
     try:
-        from docqa.doc2md.parsers.pdf import render_pdf_pages
+        from docqa.doc2md.parsers.pdf import parse_pdf
 
         rendered = renderer.render(ctx.source, ctx.work_dir / "renders")
         # Stable path: converter UUIDs must not make content identities nondeterministic.
         stable = ctx.work_dir / "renders" / "document.pdf"
         if rendered != stable:
             rendered.replace(stable)
-        assets = render_pdf_pages(replace(ctx, source=stable, render_pdf=True))
-        content.assets.extend(assets)
-        for page, asset in enumerate(assets, 1):
-            location = SourceLocator(
-                locator_type="derived_page",
-                page=page,
-                precision="page_only",
-                display_label=f"{ctx.source_name} · 本次固定渲染版第 {page} 页",
-                native_ref={"derived_pdf": "renders/document.pdf", "office_mapping": "page_only"},
-                doc_id=ctx.doc_id,
-                revision_id=ctx.revision_id,
-            )
-            figure_id = ctx.identity("office-render", page)
-            content.figures.append(
-                FigureOccurrence(
-                    figure_id=figure_id,
-                    asset_id=asset.asset_id,
-                    locator=location,
-                    full_page=True,
-                    metadata={"office_render": True},
+        rendered_content = parse_pdf(replace(ctx, source=stable, render_pdf=True))
+        if rendered_content.figures:
+            # Transformed source media stays archived. Ordinary native pictures
+            # remain usable: Word has no proven native-object -> rendered-page
+            # mapping, so finding one region cannot retire every other picture.
+            for original in content.figures:
+                if not original.analysis_required:
+                    original.metadata.update(exclude_gallery=True, replaced_by_render_regions=True)
+            content.assets.extend(rendered_content.assets)
+            for figure in rendered_content.figures:
+                location = figure.locator
+                location.locator_type = "derived_page"
+                location.precision = "page_only"
+                location.display_label = (
+                    f"{ctx.source_name} · 固定渲染第 {location.page} 页图表区域"
                 )
-            )
-            content.blocks.append(
-                Block(
-                    block_id=ctx.identity("office-render-block", page),
-                    type="figure",
-                    order=len(content.blocks),
-                    locators=[location],
-                    figure_ids=[figure_id],
+                location.native_ref.update(
+                    derived_pdf="renders/document.pdf", office_mapping="page_only"
                 )
-            )
+                figure.metadata["office_render"] = True
+                content.figures.append(figure)
+                content.blocks.append(
+                    Block(
+                        block_id=ctx.identity("office-region-block", figure.figure_id),
+                        type="figure",
+                        order=len(content.blocks),
+                        locators=[location],
+                        figure_ids=[figure.figure_id],
+                    )
+                )
+        content.warnings.extend(rendered_content.warnings)
         content.metadata["office_render_completed"] = True
         # Keep the native coverage warnings; rendering cannot prove accurate structure recovery.
         _warn(
             content,
             "OFFICE_RENDER_AVAILABLE",
-            "Fixed-page visual baseline produced; native limitations remain in the quality report",
+            "Fixed-render graphic regions extracted; native limitations remain in the quality report",
             "info",
         )
     except DocQAError as exc:
@@ -249,30 +242,207 @@ def _add_office_render(content, ctx, renderer, options, preflight):
         _warn(content, exc.code, exc.message)
 
 
-def _enrich(content, ctx, options, ocr, vision, root: Path):
+def _enrich(content, ctx, options, ocr, vision, root: Path, progress=None):
+    """Interpret selected regions with bounded concurrency and ordered IR merging."""
+    from docqa.domain.documents import VisionDescription
+
     assets = {asset.asset_id: asset for asset in content.assets}
     cache_dir = root / "cache" / "vision"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    text_context = "\n".join(block.text for block in content.blocks if block.text)[:8000]
-    for figure in content.figures:
-        if not figure.analysis_required:
-            continue
+    emit = progress or (lambda stage, current=None, total=None: None)
+    figures = [figure for figure in content.figures if figure.analysis_required]
+    emit("images", 0, len(figures))
+    # OCR is identical for identical pixels. Context-dependent VL results remain
+    # separate. Locks also prevent duplicate cache writes within this batch.
+    locks = {asset_id: threading.Lock() for asset_id in assets}
+    ocr_results = {}
+    vision_results = {}
+    breaker_lock = threading.Lock()
+    breaker = {"failures": 0, "code": None}
+    ocr_breaker = {"failures": 0, "code": None}
+
+    def recognize(image):
+        with breaker_lock:
+            if ocr_breaker["code"]:
+                raise DocQAError("OCR_BATCH_PAUSED", "Repeated OCR failures paused this batch")
+        try:
+            result = ocr.recognize(image)
+        except DocQAError as exc:
+            with breaker_lock:
+                if exc.code in {"OCR_NOT_FOUND", "OCR_START_FAILED", "OCR_LANGUAGE_MISSING"}:
+                    ocr_breaker["code"] = exc.code
+                elif exc.code in {"OCR_TIMEOUT", "OCR_FAILED", "OCR_LANGUAGE_CHECK_FAILED"}:
+                    ocr_breaker["failures"] += 1
+                    if ocr_breaker["failures"] >= 2:
+                        ocr_breaker["code"] = exc.code
+            raise
+        with breaker_lock:
+            ocr_breaker["failures"] = 0
+        return result
+
+    def analyze(figure):
+        warnings = []
         asset = assets[figure.asset_id]
         image = ctx.work_dir / asset.relative_path
-        if options.ocr_mode != "disabled":
-            try:
-                figure.ocr_text = ocr.recognize(image)
-            except DocQAError as exc:
-                if options.ocr_mode == "required":
-                    raise
-                severity = "warning" if figure.metadata.get("needs_ocr") else "info"
-                _warn(content, exc.code, f"{figure.locator.display_label}: {exc.message}", severity)
-        elif figure.metadata.get("needs_ocr"):
-            _warn(
-                content,
-                "OCR_DISABLED",
-                f"{figure.locator.display_label}: scanned text has no OCR transcription",
+        location = figure.locator
+        owning_order = next(
+            (b.order for b in content.blocks if figure.figure_id in b.figure_ids), -100
+        )
+        local_blocks = [
+            b.text
+            for b in content.blocks
+            if b.text
+            and any(
+                (location.page is not None and loc.page == location.page)
+                or (location.slide is not None and loc.slide == location.slide)
+                or (
+                    location.page is None
+                    and location.slide is None
+                    and abs(b.order - owning_order) <= 3
+                )
+                for loc in b.locators
             )
+        ]
+        context = (
+            figure.caption
+            + "\n"
+            + figure.metadata.get("native_text_in_region", "")
+            + "\n"
+            + "\n".join(local_blocks)
+        )[:3000]
+        needs_ocr = figure.metadata.get("needs_ocr", False)
+        # Native labels are already extracted, so don't repeat OCR on vectors.
+        run_ocr = options.ocr_mode != "disabled" and (
+            needs_ocr
+            or options.ocr_mode == "required"
+            or not figure.metadata.get("native_text_in_region", "").strip()
+        )
+        with locks[figure.asset_id]:
+            if run_ocr:
+                if asset.sha256 not in ocr_results:
+                    try:
+                        ocr_results[asset.sha256] = (recognize(image), None)
+                    except DocQAError as exc:
+                        ocr_results[asset.sha256] = ("", exc)
+                figure.ocr_text, error = ocr_results[asset.sha256]
+                if error:
+                    if options.ocr_mode == "required":
+                        raise error
+                    warnings.append(
+                        ParseWarning(
+                            code=error.code,
+                            message=f"{location.display_label}: {error.message}",
+                            severity="warning" if needs_ocr else "info",
+                        )
+                    )
+            elif needs_ocr:
+                warnings.append(
+                    ParseWarning(
+                        code="OCR_DISABLED",
+                        message=f"{location.display_label}: scanned text has no OCR transcription",
+                    )
+                )
+            if figure.metadata.get("vision_required") is False:
+                figure.semantic_state = "ocr_only" if figure.ocr_text else "disabled"
+                return warnings
+            if vision is None:
+                figure.semantic_state = "ocr_only" if figure.ocr_text else "disabled"
+                warnings.append(
+                    ParseWarning(
+                        code="VISION_DISABLED",
+                        message=f"{location.display_label}: image semantics were not interpreted",
+                    )
+                )
+                return warnings
+            key = digest(
+                {
+                    "image": asset.sha256,
+                    "ocr": figure.ocr_text,
+                    "context": context,
+                    "profile": vision.fingerprint(),
+                    "analysis_revision": options.analysis_revision,
+                }
+            )
+            cached = cache_dir / (key + ".json")
+            try:
+                if key in vision_results:
+                    description = vision_results[key].model_copy(deep=True)
+                elif cached.exists():
+                    description = VisionDescription.model_validate_json(cached.read_bytes())
+                else:
+                    with breaker_lock:
+                        paused = breaker["code"]
+                    if paused:
+                        raise DocQAError(
+                            "VISION_BATCH_PAUSED", "Repeated vision failures paused this batch"
+                        )
+                    description = VisionDescription.model_validate(
+                        vision.describe(image, ocr_text=figure.ocr_text, context=context)
+                    )
+                    with breaker_lock:
+                        breaker["failures"] = 0
+                    if (
+                        description.status in {"ok", "no_semantic_content"}
+                        and not description.uncertainties
+                        and not any(e.direction == "unknown" for e in description.relations)
+                    ):
+                        _json(cached, description.model_dump(mode="json"))
+                vision_results[key] = description
+                figure.vision = description
+                figure.semantic_state = "described"
+                if (
+                    description.status in {"partial", "unreadable"}
+                    or description.uncertainties
+                    or any(e.direction == "unknown" for e in description.relations)
+                ):
+                    warnings.append(
+                        ParseWarning(
+                            code="VISION_REVIEW_REQUIRED",
+                            message=f"{location.display_label}: vision result contains uncertainty",
+                        )
+                    )
+            except (DocQAError, ValueError, OSError) as exc:
+                figure.semantic_state = "failed"
+                code = exc.code if isinstance(exc, DocQAError) else "VISION_CACHE_INVALID"
+                service_failures = {
+                    "VISION_SERVICE_UNAVAILABLE",
+                    "VISION_TRANSPORT_FAILED",
+                    "VISION_HTTP_ERROR",
+                    "VISION_RESPONSE_INVALID",
+                    "VISION_SCHEMA_INVALID",
+                }
+                with breaker_lock:
+                    if code in {
+                        "VISION_AUTH_FAILED",
+                        "VISION_KEY_MISSING",
+                        "VISION_REDIRECT_BLOCKED",
+                    }:
+                        breaker["code"] = code
+                    elif code in service_failures:
+                        breaker["failures"] += 1
+                        threshold = (
+                            3 if code in {"VISION_SCHEMA_INVALID", "VISION_RESPONSE_INVALID"} else 2
+                        )
+                        if breaker["failures"] >= threshold:
+                            breaker["code"] = code
+                figure.metadata["vision_failure_code"] = code
+                warnings.append(
+                    ParseWarning(
+                        code=code, message=f"{location.display_label}: image interpretation failed"
+                    )
+                )
+        return warnings
+
+    results = {}
+    with ThreadPoolExecutor(
+        max_workers=options.image_workers, thread_name_prefix="image-analysis"
+    ) as pool:
+        pending = {pool.submit(analyze, f): i for i, f in enumerate(figures)}
+        for future in as_completed(pending):
+            results[pending[future]] = future.result()
+            emit("images", len(results), len(figures))
+    for index, figure in enumerate(figures):
+        content.warnings.extend(results[index])
         if figure.metadata.get("needs_ocr") and figure.ocr_text:
             content.blocks.append(
                 Block(
@@ -286,57 +456,8 @@ def _enrich(content, ctx, options, ocr, vision, root: Path):
                     metadata={"source_figure": figure.figure_id},
                 )
             )
-        if vision is None:
-            figure.semantic_state = "ocr_only" if figure.ocr_text else "disabled"
-            _warn(
-                content,
-                "VISION_DISABLED",
-                f"{figure.locator.display_label}: image semantics were not interpreted",
-            )
-            continue
-        key = digest(
-            {
-                "image": asset.sha256,
-                "ocr": figure.ocr_text,
-                "context": text_context,
-                "profile": vision.fingerprint(),
-                "analysis_revision": options.analysis_revision,
-            }
-        )
-        cached = cache_dir / (key + ".json")
-        try:
-            from docqa.domain.documents import VisionDescription
-
-            if cached.exists():
-                description = VisionDescription.model_validate_json(cached.read_bytes())
-            else:
-                description = vision.describe(image, ocr_text=figure.ocr_text, context=text_context)
-                description = VisionDescription.model_validate(description)
-                if (
-                    description.status in {"ok", "no_semantic_content"}
-                    and not description.uncertainties
-                    and not any(edge.direction == "unknown" for edge in description.relations)
-                ):
-                    _json(cached, description.model_dump(mode="json"))
-            figure.vision = description
-            figure.semantic_state = "described"
-            if (
-                description.status in {"partial", "unreadable"}
-                or description.uncertainties
-                or any(edge.direction == "unknown" for edge in description.relations)
-            ):
-                _warn(
-                    content,
-                    "VISION_REVIEW_REQUIRED",
-                    f"{figure.locator.display_label}: vision result contains uncertainty",
-                )
-        except (DocQAError, ValueError, OSError) as exc:
-            figure.semantic_state = "failed"
-            code = exc.code if isinstance(exc, DocQAError) else "VISION_CACHE_INVALID"
-            _warn(content, code, f"{figure.locator.display_label}: image description unavailable")
-    # Keep source order; OCR text is already visible with its figure and has its own IR block.
-    for order, block in enumerate(content.blocks):
-        block.order = order
+    for index, block in enumerate(content.blocks):
+        block.order = index
 
 
 def _quality(ir: DocumentIR) -> dict:
@@ -525,6 +646,7 @@ def parse_document(
     ocr_client=None,
     vision_client=None,
     office_renderer=None,
+    progress=None,
 ) -> ParseResult:
     try:
         return _parse_document(
@@ -535,6 +657,7 @@ def parse_document(
             ocr_client=ocr_client,
             vision_client=vision_client,
             office_renderer=office_renderer,
+            progress=progress,
         )
     except OSError as exc:
         raise DocQAError(
@@ -553,6 +676,7 @@ def _parse_document(
     ocr_client=None,
     vision_client=None,
     office_renderer=None,
+    progress=None,
 ) -> ParseResult:
     """Parse one explicitly selected file without rewriting an existing artifact."""
     options = options or ParseOptions()
@@ -614,6 +738,7 @@ def _parse_document(
                     profile,
                     profile_id,
                     connection,
+                    progress,
                 )
             finally:
                 connection.close()
@@ -642,7 +767,10 @@ def _parse_locked(
     profile,
     profile_id,
     connection,
+    progress=None,
 ):
+    emit = progress or (lambda stage, current=None, total=None: None)
+    emit("reading")
     path_key = os.path.normcase(str(source))
     row = connection.execute(
         "SELECT doc_id FROM documents WHERE path_key=?", (path_key,)
@@ -677,6 +805,7 @@ def _parse_locked(
             previous = json.loads(io_path(directory / "manifest.json").read_bytes())
             # An unavailable service/key must not permanently cache a partial result.
             if previous["quality"]["status"] == "complete":
+                emit("parsed", 1, 1)
                 return _result(previous, directory, reused=True)
         ctx = ParseContext(
             blob,
@@ -689,6 +818,7 @@ def _parse_locked(
             options.max_pixels,
             options.render_pdf,
         )
+        emit("extracting")
         if legacy:
             if preflight.get("external_resources"):
                 raise DocQAError("OFFICE_EXTERNAL_RESOURCES", "External resources block conversion")
@@ -708,7 +838,8 @@ def _parse_locked(
             content = _parse_native(ctx, fmt)
             if fmt in {"docx", "pptx"}:
                 _add_office_render(content, ctx, renderer, options, preflight)
-        _enrich(content, ctx, options, ocr, vision, root)
+        _enrich(content, ctx, options, ocr, vision, root, progress=progress)
+        emit("markdown")
         from docqa.doc2md.figure_names import name_figures
 
         name_figures(content, ctx)
@@ -792,6 +923,7 @@ def _parse_locked(
                 "INSERT INTO artifacts VALUES(?,?,?,?) ON CONFLICT(parse_key) DO UPDATE SET artifact_id=excluded.artifact_id",
                 (parse_key, artifact_id, document_id, revision_id),
             )
+        emit("parsed", 1, 1)
         return _result(manifest, directory)
 
 
@@ -801,7 +933,7 @@ def batch_parse(
     *,
     recursive: bool = True,
     options: ParseOptions | None = None,
-    types: tuple[str, ...] = ("pdf", "docx", "pptx"),
+    types: tuple[str, ...] = NATIVE_FORMATS,
 ) -> dict:
     """Continue after individual failures; batch result is explicit about omissions."""
     source = Path(directory).resolve()
@@ -812,7 +944,7 @@ def batch_parse(
         raise DocQAError(
             "INVALID_OUTPUT", "Batch source and output directories must not contain each other"
         )
-    if not set(types).issubset({"pdf", "docx", "pptx", "doc", "ppt"}):
+    if not set(types).issubset(ALL_FORMATS):
         raise DocQAError("INVALID_REQUEST", "Unknown batch file type")
     selected = options or ParseOptions(allowed_roots=[source])
     files = sorted(source.rglob("*") if recursive else source.iterdir())

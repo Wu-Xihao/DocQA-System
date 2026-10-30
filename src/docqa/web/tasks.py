@@ -212,6 +212,8 @@ class QuestionManager:
         self.shutdown = threading.Event()
         self.wakeup = threading.Event()
         self.thread = None
+        self.threads = []
+        self.warm_runners = {}
         self.lock = None
         self.lifecycle = threading.Lock()
         self.activity = threading.RLock()
@@ -219,7 +221,9 @@ class QuestionManager:
 
     @property
     def ready(self):
-        return bool(self.thread and self.thread.is_alive() and not self.shutdown.is_set())
+        return bool(
+            self.threads and all(t.is_alive() for t in self.threads) and not self.shutdown.is_set()
+        )
 
     def start(self):
         with self.lifecycle:
@@ -236,10 +240,13 @@ class QuestionManager:
             try:
                 self.store.recover()
                 self.shutdown.clear()
-                self.thread = threading.Thread(
-                    target=self._loop, name="docqa-web-worker", daemon=True
-                )
-                self.thread.start()
+                self.threads = [
+                    threading.Thread(target=self._loop, name=f"docqa-web-worker-{i}", daemon=True)
+                    for i in range(self.options.query_workers)
+                ]
+                self.thread = self.threads[0]
+                for thread in self.threads:
+                    thread.start()
             except BaseException:
                 self.shutdown.set()
                 worker_lock.release()
@@ -249,10 +256,13 @@ class QuestionManager:
     def stop(self):
         self.shutdown.set()
         self.wakeup.set()
-        if self.thread:
-            self.thread.join(timeout=15)
-        if self.thread and self.thread.is_alive():
+        for thread in self.threads:
+            thread.join(timeout=15)
+        if any(thread.is_alive() for thread in self.threads):
             raise DocQAError("WEB_WORKER_STOP_FAILED", "Question worker did not finish shutdown")
+        for runner in self.warm_runners.values():
+            runner.close()
+        self.warm_runners.clear()
         if self.lock:
             self.lock.release()
 
@@ -316,13 +326,23 @@ class QuestionManager:
         return self.options.state / "agent" / job_id
 
     def answer(self, job):
-        if not job["result"]:
+        if not job["result"] or job["payload"].get("mode") == "chat":
             return None
         return SessionStore(self.agent_state(job["job_id"])).load_answer(job["result"]["answer_id"])
 
+    def chat(self, job):
+        if not job["result"] or job["payload"].get("mode") != "chat":
+            return None
+        from docqa.web.chat import ChatResult
+
+        return ChatResult.model_validate(job["result"]["chat"]).model_dump(
+            mode="json", exclude={"request_sha256"}
+        )
+
     def retrieval_preview(self, job):
-        if job["state"] != "running":
+        if job["state"] != "running" or job["payload"].get("mode") == "chat":
             return []
+
         path = _io_path(self.agent_state(job["job_id"]) / "retrieval-preview.json")
         try:
             if path.stat().st_size > 16384:
@@ -343,6 +363,19 @@ class QuestionManager:
         except (OSError, ValueError, TypeError):
             return []
 
+    def chat_preview(self, job):
+        if job["state"] != "running" or job["payload"].get("mode") != "chat":
+            return None
+        from docqa.web.chat import load_chat
+
+        try:
+            value = load_chat(self.agent_state(job["job_id"]), "chat-preview.json")
+            if value.job_id != job["job_id"]:
+                return None
+            return value.model_dump(mode="json", exclude={"request_sha256"})
+        except DocQAError:
+            return None
+
     def _loop(self):
         while not self.shutdown.is_set():
             try:
@@ -355,17 +388,32 @@ class QuestionManager:
                     self.wakeup.clear()
                     continue
                 try:
-                    runner = (
-                        self.runner_factory(job)
-                        if self.runner_factory
-                        else HeadlessRunner(
-                            self.options.index,
-                            self.agent_state(job["job_id"]),
-                            self.options.agent,
-                            self.options.state / "runs",
-                            timeout_seconds=self.options.runner_timeout_seconds,
+                    if self.options.reuse_workers and not self.runner_factory:
+                        from docqa.web.warm_runner import WarmRunner
+
+                        key = threading.get_ident()
+                        if key not in self.warm_runners:
+                            self.warm_runners[key] = WarmRunner(
+                                self.options.index,
+                                self.agent_state(job["job_id"]),
+                                self.options.agent,
+                                self.options.state / "runs",
+                                timeout_seconds=self.options.runner_timeout_seconds,
+                            )
+                        runner = self.warm_runners[key]
+                        runner.agent_state = self.agent_state(job["job_id"])
+                    else:
+                        runner = (
+                            self.runner_factory(job)
+                            if self.runner_factory
+                            else HeadlessRunner(
+                                self.options.index,
+                                self.agent_state(job["job_id"]),
+                                self.options.agent,
+                                self.options.state / "runs",
+                                timeout_seconds=self.options.runner_timeout_seconds,
+                            )
                         )
-                    )
                     receipt = runner.run(
                         job["job_id"],
                         job["payload"],
@@ -375,6 +423,15 @@ class QuestionManager:
                         ),
                         progress=lambda stage: self.store.stage(job["job_id"], stage),
                     )
+                    if job["payload"].get("mode") == "chat":
+                        from docqa.web.chat import load_chat
+
+                        receipt = {
+                            **receipt,
+                            "chat": load_chat(self.agent_state(job["job_id"])).model_dump(
+                                mode="json"
+                            ),
+                        }
                     error_code = None
                     if receipt["status"] == "failed":
                         failed = SessionStore(self.agent_state(job["job_id"])).load_answer(

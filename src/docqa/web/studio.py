@@ -18,6 +18,7 @@ LABELS = {
     "mindmap": "思维导图",
     "report": "研究文档",
     "slides": "演示文稿",
+    "wordcloud": "词云",
 }
 
 
@@ -71,6 +72,10 @@ def build_content(answer, kind, plan=None):
             ]
             for f in facts
         ]
+    elif kind == "wordcloud":
+        from docqa.web.wordcloud import build_wordcloud
+
+        content.update(build_wordcloud(facts))
     elif kind == "relation":
         if not answer.diagram_edges:
             raise DocQAError(
@@ -195,6 +200,20 @@ def markdown(artifact):
         lines += ["> 演示成果：未经过真实模型语义验收。", ""]
     if value["quality"] != "answered":
         lines += ["> 本成果有来源覆盖缺口；仅整理已支持内容，未解析部分不能据此推断。", ""]
+    if artifact["kind"] == "wordcloud":
+        lines += [
+            "## 关键词词频",
+            "",
+            "仅统计当前已核验回答，不表示整个资料库的词频或重要性。",
+            "",
+            "| 关键词 | 次数 | 来源 |",
+            "| --- | --- | --- |",
+        ]
+        lines += [
+            f"| {w['text']} | {w['weight']} | " + " ".join(f"[{s}]" for s in w["sources"]) + " |"
+            for w in value["words"]
+        ]
+        lines += ["", "## 已核验内容", ""]
     groups = (
         value.get("tree", {}).get("children") if artifact["kind"] in {"mindmap", "slides"} else None
     )
@@ -400,6 +419,10 @@ def graph_svg(artifact):
 
 
 def export_bytes(artifact, format_name):
+    if artifact["kind"] == "wordcloud" and format_name in {"svg", "png"}:
+        from docqa.web.wordcloud import export_wordcloud
+
+        return export_wordcloud(artifact, format_name)
     if format_name == "json":
         return json.dumps(artifact, ensure_ascii=False, indent=2).encode(), "application/json"
     if format_name in {"md", "markdown"}:

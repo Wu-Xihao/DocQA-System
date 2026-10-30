@@ -226,9 +226,20 @@ def query(
     mode: str = "hybrid",
     allow_degraded: bool | None = None,
     providers=None,
+    filters=None,
 ) -> QueryResult:
-    """Return evidence, not a generated answer or a calibrated answerability claim."""
+    """Return evidence, not a generated answer or a calibrated answerability claim.
+
+    ``filters`` is an optional ChunkFilter (or dict) of AND-combined metadata
+    conditions applied, like categories/doc_ids, before any route is queried.
+    """
+    from docqa.docbase.filters import coerce_filter
+
     options = options or DocBaseOptions()
+    try:
+        conditions = coerce_filter(filters)
+    except ValueError as exc:
+        raise DocQAError("INVALID_REQUEST", "Invalid retrieval filter conditions") from exc
     if (
         not isinstance(question, str)
         or not question.strip()
@@ -269,13 +280,22 @@ def query(
             synthetic=generation.manifest["synthetic"],
             production_ready=generation.manifest["production_ready"],
             retrieval_mode=mode,
-            applied_filter={"categories": categories, "doc_ids": doc_ids},
+            applied_filter={
+                "categories": categories,
+                "doc_ids": doc_ids,
+                **(
+                    {"conditions": conditions.model_dump(mode="json", exclude_none=True)}
+                    if conditions
+                    else {}
+                ),
+            },
             retrieval_profile_id=digest(
                 {
                     "options": options.model_dump(mode="json"),
                     "top_k": count,
                     "mode": mode,
                     "allow_degraded": permitted,
+                    **({"conditions": conditions.model_dump(mode="json")} if conditions else {}),
                 }
             ),
         )
@@ -284,6 +304,7 @@ def query(
             for row, chunk in enumerate(generation.chunks)
             if (categories is None or chunk.category in categories)
             and (doc_ids is None or chunk.doc_id in doc_ids)
+            and (conditions is None or conditions.matches(chunk))
         ]
         if not eligible:
             return QueryResult(

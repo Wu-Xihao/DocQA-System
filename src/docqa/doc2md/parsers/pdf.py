@@ -403,6 +403,106 @@ def _page_figure(ctx, render_page, page, content, embedded, needs_ocr):
     return figure_id
 
 
+def _region_figures(ctx, render_page, page, content, needs_ocr):
+    from docqa.doc2md.regions import graphic_regions
+
+    regions, scan, limited = graphic_regions(page)
+    if limited:
+        content.warnings.append(
+            ParseWarning(
+                code="VISUAL_REGION_LIMIT",
+                message=f"Page {page.page_number}: graphic detection exceeded its resource limit; check the original",
+            )
+        )
+    ids = []
+    # A full-page scan is a text/OCR source, never automatically a diagram for VL.
+    if scan and (needs_ocr or len(page.chars) < 80):
+        embedded = _embedded_images(ctx, render_page, page, content)
+        identity = _page_figure(ctx, render_page, page, content, embedded, True)
+        figure = content.figures[-1]
+        figure.caption = f"扫描第 {page.page_number} 页正文 OCR（非独立图表）"
+        figure.metadata.update(role="page_ocr", vision_required=False, exclude_gallery=True)
+        content.warnings.append(
+            ParseWarning(
+                code="SCANNED_FIGURES_NEED_REVIEW",
+                message=f"Page {page.page_number}: OCR text preserved; figures inside the scan require region review",
+            )
+        )
+        return [identity]
+    if scan:
+        content.warnings.append(
+            ParseWarning(
+                code="SCANNED_FIGURES_NEED_REVIEW",
+                message=f"Page {page.page_number}: native text layer retained; diagrams inside the full-page scan need region review",
+            )
+        )
+    if not regions:
+        return ids
+    scale = ctx.render_dpi / 72
+    w, h = render_page.get_size()
+    if math.ceil(w * scale) * math.ceil(h * scale) > ctx.max_pixels:
+        raise DocQAError("RESOURCE_LIMIT_EXCEEDED", "PDF page exceeds region-render pixel limit")
+    bitmap = render_page.render(scale=scale)
+    try:
+        image = bitmap.to_pil()
+        try:
+            for number, region in enumerate(regions, 1):
+                b = _bbox(page, region["box"])
+                crop = image.crop(
+                    (
+                        max(0, math.floor(b[0] * image.width)),
+                        max(0, math.floor(b[1] * image.height)),
+                        min(image.width, math.ceil(b[2] * image.width)),
+                        min(image.height, math.ceil(b[3] * image.height)),
+                    )
+                )
+                try:
+                    buffer = BytesIO()
+                    crop.save(buffer, format="PNG")
+                finally:
+                    crop.close()
+                asset = ctx.save_image(buffer.getvalue(), f"Page{page.page_number}_Region{number}")
+                if asset.asset_id not in {a.asset_id for a in content.assets}:
+                    content.assets.append(asset)
+                locator = _locator(
+                    ctx,
+                    page,
+                    region["box"],
+                    extra={"render_dpi": ctx.render_dpi, "region_detection": "graphic_geometry.v1"},
+                )
+                figure_id = ctx.identity("pdf-region", page.page_number, number, list(b))
+                content.figures.append(
+                    FigureOccurrence(
+                        figure_id=figure_id,
+                        asset_id=asset.asset_id,
+                        locator=locator,
+                        caption=region["caption"] or f"第 {page.page_number} 页图表 {number}",
+                        metadata={
+                            "extraction": "pdfium_region_render",
+                            "needs_ocr": region["raster"] or not region["native_text"].strip(),
+                            "native_text_in_region": region["native_text"],
+                            "primitive_count": region["primitive_count"],
+                            "region_detection": "heuristic",
+                        },
+                    )
+                )
+                content.blocks.append(
+                    Block(
+                        block_id=ctx.identity("pdf-region-block", figure_id),
+                        type="figure",
+                        order=len(content.blocks),
+                        locators=[locator],
+                        figure_ids=[figure_id],
+                    )
+                )
+                ids.append(figure_id)
+        finally:
+            image.close()
+    finally:
+        bitmap.close()
+    return ids
+
+
 def _fallback_figures(ctx, page, content, embedded, needs_ocr):
     """Preserve available bitmaps if the user explicitly disables rendering."""
     figure_ids = []
@@ -507,7 +607,11 @@ def parse_pdf(ctx: ParseContext) -> ParsedContent:
                 }
                 if should_preserve_visual:
                     with closing(rendered[page_index]) as render_page:
-                        embedded = _embedded_images(ctx, render_page, page, content)
+                        embedded = (
+                            []
+                            if ctx.render_pdf
+                            else _embedded_images(ctx, render_page, page, content)
+                        )
                         page_info["original_images"] = [
                             {
                                 "asset_id": asset.asset_id,
@@ -518,10 +622,19 @@ def parse_pdf(ctx: ParseContext) -> ParsedContent:
                             for asset, index, bounds in embedded
                         ]
                         if ctx.render_pdf:
-                            page_info["figure_ids"] = [
-                                _page_figure(ctx, render_page, page, content, embedded, needs_ocr)
+                            page_info["figure_ids"] = _region_figures(
+                                ctx, render_page, page, content, needs_ocr
+                            )
+                            page_info["full_page"] = any(
+                                f.full_page
+                                for f in content.figures
+                                if f.figure_id in page_info["figure_ids"]
+                            )
+                            page_info["original_images"] = [
+                                {"original_asset_id": f.original_asset_id, "figure_id": f.figure_id}
+                                for f in content.figures
+                                if f.figure_id in page_info["figure_ids"] and f.original_asset_id
                             ]
-                            page_info["full_page"] = True
                         else:
                             page_info["figure_ids"] = _fallback_figures(
                                 ctx, page, content, embedded, needs_ocr
@@ -534,7 +647,9 @@ def parse_pdf(ctx: ParseContext) -> ParsedContent:
                             )
                 content.metadata["pages"].append(page_info)
                 page.close()
-            return content
+            from docqa.doc2md.table_links import link_pdf_tables
+
+            return link_pdf_tables(content)
     except DocQAError:
         raise
     except (PDFPasswordIncorrect, PDFEncryptionError) as exc:

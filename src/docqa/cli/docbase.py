@@ -111,7 +111,34 @@ def query_command(
         str, typer.Option("--mode", help="hybrid | rrf | dense | bm25 | sparse")
     ] = "hybrid",
     degraded: Annotated[bool | None, typer.Option("--allow-degraded/--no-allow-degraded")] = None,
+    doc_type: Annotated[list[str] | None, typer.Option("--type", help="pdf/docx/xlsx...")] = None,
+    content: Annotated[
+        list[str] | None, typer.Option("--content", help="text | table | figure")
+    ] = None,
+    origin: Annotated[
+        list[str] | None, typer.Option("--origin", help="native | ocr | vl_generated")
+    ] = None,
+    page_from: Annotated[int | None, typer.Option("--page-from")] = None,
+    page_to: Annotated[int | None, typer.Option("--page-to")] = None,
+    name: Annotated[str | None, typer.Option("--name-contains")] = None,
+    section: Annotated[str | None, typer.Option("--section-contains")] = None,
+    must: Annotated[
+        list[str] | None, typer.Option("--must", help="Term that must appear; repeatable")
+    ] = None,
+    exclude: Annotated[list[str] | None, typer.Option("--exclude-doc-id")] = None,
 ):
+    """Search with AND-combined conditions; values of one repeated option are ORed."""
+    filters = {
+        "doc_types": doc_type,
+        "content_types": content,
+        "origins": origin,
+        "page_from": page_from,
+        "page_to": page_to,
+        "source_name_contains": name,
+        "section_contains": section,
+        "must_contain": must,
+        "exclude_doc_ids": exclude,
+    }
     try:
         result = query(
             index,
@@ -123,6 +150,7 @@ def query_command(
             top_k=top_k,
             mode=mode,
             allow_degraded=degraded,
+            filters={key: value for key, value in filters.items() if value is not None},
         )
         _emit(result.model_dump(mode="json"))
         if result.status == "degraded":

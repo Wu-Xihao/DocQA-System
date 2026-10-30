@@ -19,6 +19,7 @@ from docqa.agent.evidence import build_evidence_items, revalidate_evidence_batch
 from docqa.agent.performance import PhaseMetrics, balanced_evidence
 from docqa.agent.planning import conservative_plan, validate_plan
 from docqa.agent.providers import make_chat_clients
+from docqa.agent.quotes import bind_quote_selections
 from docqa.agent.rendering import render_answer
 from docqa.agent.retrieval import CandidateLedger, Subquery, normalize_query
 from docqa.agent.sessions import SessionStore
@@ -849,6 +850,11 @@ def answer_question(
                         raise DocQAError(
                             "ANSWER_INVALID", "Composer changed the requested output format"
                         )
+                    draft, selected_quotes = bind_quote_selections(draft, all_items)
+                    if selected_quotes:
+                        trace.append(
+                            {"stage": "quote_selections_resolved", "count": selected_quotes}
+                        )
                     draft, reconciled = validate_builtin_draft(
                         draft, all_items, plan.required_topics
                     )
@@ -976,7 +982,21 @@ def answer_question(
             if isinstance(exc, DocQAError)
             else DocQAError("AGENT_FAILED", "Agent orchestration failed")
         )
-        trace.append({"stage": "failed", "code": error.code, "model_tasks": budget.used})
+        trace.append(
+            {
+                "stage": "failed",
+                "code": error.code,
+                "model_tasks": budget.used,
+                **(
+                    {
+                        "validation_rule": error.rule,
+                        "validation_errors": list(getattr(error, "violations", ())),
+                    }
+                    if hasattr(error, "rule")
+                    else {}
+                ),
+            }
+        )
         return _failed(
             store,
             session,

@@ -55,6 +55,8 @@ class ImageService:
             origin_block = next(b for b in ir.blocks if b.block_id == citation.source_span.block_id)
             orders = {f: b.order for b in ir.blocks for f in b.figure_ids}
             for figure in ir.figures:
+                if figure.full_page or figure.metadata.get("exclude_gallery"):
+                    continue
                 direct = figure.figure_id == citation.source_span.figure_id
                 relation = "direct" if direct else None
                 if not relation:
@@ -102,6 +104,8 @@ class ImageService:
                     "related_by": relation,
                     "image_kind": "page_render" if figure.full_page else "figure",
                     "semantic_state": figure.semantic_state,
+                    "analysis_required": figure.analysis_required,
+                    "vision": figure.vision.model_dump(mode="json") if figure.vision else None,
                     "width": asset.width,
                     "height": asset.height,
                 }

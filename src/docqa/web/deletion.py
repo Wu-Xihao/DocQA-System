@@ -58,7 +58,7 @@ class DeletionService:
                     ).fetchall()
                     for row in rows:
                         jobs.add(row["job_id"])
-                        if row["result"]:
+                        if row["result"] and json.loads(row["result"]).get("answer_id"):
                             answers.add(json.loads(row["result"])["answer_id"])
                     # Blocks new questions immediately; the running runner sees cancellation.
                     db.execute(
@@ -79,7 +79,7 @@ class DeletionService:
                 objects = [
                     (r["kind"], r["id"], json.loads(r["payload"]))
                     for r in db.execute(
-                        "SELECT kind,id,payload FROM ws_objects WHERE owner=? AND kind IN ('artifact','artifact_job','export','media')",
+                        "SELECT kind,id,payload FROM ws_objects WHERE owner=? AND kind IN ('artifact','artifact_job','export','media','visual_check')",
                         (owner,),
                     )
                 ]
@@ -111,7 +111,7 @@ class DeletionService:
                         or (k == "export" and value.get("artifact_id") in artifacts)
                         or (
                             kind == "conversation"
-                            and k == "media"
+                            and k in {"media", "visual_check"}
                             and value.get("answer_id") in answers
                         )
                     )

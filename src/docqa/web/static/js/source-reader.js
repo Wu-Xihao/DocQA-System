@@ -1,5 +1,6 @@
 import { $, el, button, text, clear, richText, errorText } from "./dom.js";
 import { api, plain } from "./api.js";
+import { imageAnalysis } from "./image-analysis.js";
 
 let current = 0;
 export function sourcePending(title) {
@@ -111,7 +112,7 @@ export function openSourceReader(source) {
   );
   clear("preview-sources");
   const sidebar = $("preview-sources");
-  sidebar.append(el("h3", "", "本次引用"));
+  sidebar.append(el("h3", "", source.quote_title || "本次引用"));
   if (source.quote)
     sidebar.append(el("blockquote", "reader-quote", source.quote));
   sidebar.append(
@@ -137,7 +138,7 @@ export function openSourceReader(source) {
       el(
         "p",
         "subtle",
-        "Word/PPT 将交给浏览器或本机 Office 打开；下方正文视图不会还原全部原始版式。",
+        "Word/PPT/Excel/CSV 将交给浏览器或本机 Office 打开；下方正文视图不会还原全部原始版式。",
       ),
     );
   const root = el("div", "source-reader"),
@@ -191,8 +192,10 @@ export function openSourceReader(source) {
               dialog.append(
                 button("关闭", () => dialog.close()),
                 el("p", "", image.caption + " · " + image.location),
-                large,
               );
+              const body = el("div", "reader-image-dialog-body");
+              body.append(large, imageAnalysis(image));
+              dialog.append(body);
               dialog.addEventListener("close", () => dialog.remove(), {
                 once: true,
               });
@@ -209,6 +212,7 @@ export function openSourceReader(source) {
                   (image.analysis_required ? "" : " · 归档/辅助图"),
               ),
               open,
+              imageAnalysis(image, { compact: true }),
             );
             grid.append(card);
           }

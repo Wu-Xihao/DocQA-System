@@ -7,6 +7,8 @@ caller may provide a hit ID, but none of its text, paths or locators is trusted.
 from __future__ import annotations
 
 import json
+import re
+from bisect import bisect_left
 from hashlib import sha256
 from pathlib import Path
 
@@ -17,6 +19,9 @@ from docqa.docbase.storage import _io_path, _safe_path, load_generation
 from docqa.domain.answers import EvidenceItem, EvidencePack
 from docqa.domain.documents import DocumentIR
 from docqa.domain.errors import DocQAError
+from docqa.integrity import VerifiedCache, file_stamp
+
+_SOURCE_IR = VerifiedCache(max_entries=12, max_bytes=64 * 1024 * 1024, serialized=True)
 
 
 def json_bytes(value) -> bytes:
@@ -46,14 +51,33 @@ def _source(generation, chunk):
     if member is None:
         raise DocQAError("EVIDENCE_SOURCE_INVALID", "Chunk has no generation member")
     artifact = _safe_path(generation.directory, member["artifact_ref"])
-    ir = DocumentIR.model_validate_json(_io_path(artifact / "document.ir.json").read_bytes())
+    path = _io_path(artifact / "document.ir.json")
+    key = str(path)
+    with _SOURCE_IR.guard(key):
+        before = file_stamp(path)
+        ir = _SOURCE_IR.get(key, before)
+        if ir is None:
+            raw = path.read_bytes()
+            ir = DocumentIR.model_validate_json(raw)
+            after = file_stamp(path)
+            if before != after:
+                raise DocQAError("EVIDENCE_SOURCE_INVALID", "Source changed while reading evidence")
+            _SOURCE_IR.put(key, after, ir, len(raw) * 6)
+        if file_stamp(path) != before:
+            raise DocQAError("EVIDENCE_SOURCE_INVALID", "Source changed while loading evidence")
     return artifact, ir
 
 
-def _reference(generation, chunk, span, artifact, ir) -> dict:
+def _reference_package(artifact):
     manifest = json.loads(_io_path(artifact / "manifest.json").read_bytes())
     snapshot = _safe_path(artifact.parent.parent, manifest["snapshot_ref"])
     markdown = _io_path(artifact / "document.md").read_bytes()
+    newlines = [match.start() for match in re.finditer(b"\n", markdown)]
+    return snapshot, markdown, newlines
+
+
+def _reference(generation, chunk, span, artifact, ir, package=None) -> dict:
+    snapshot, markdown, newlines = package if package is not None else _reference_package(artifact)
     raw = markdown[span.markdown_start_byte : span.markdown_end_byte]
     # SourceSpan v1 identifies the owning Markdown block. Its exact component
     # codepoint interval is a separate coordinate, not a fake exact MD subrange.
@@ -87,8 +111,8 @@ def _reference(generation, chunk, span, artifact, ir) -> dict:
         "snapshot_path": str(snapshot),
         "markdown_start_byte": span.markdown_start_byte,
         "markdown_end_byte": span.markdown_end_byte,
-        "markdown_start_line": markdown[: span.markdown_start_byte].count(b"\n") + 1,
-        "markdown_end_line": markdown[: span.markdown_end_byte].count(b"\n") + 1,
+        "markdown_start_line": bisect_left(newlines, span.markdown_start_byte) + 1,
+        "markdown_end_line": bisect_left(newlines, span.markdown_end_byte) + 1,
         "markdown_range_precision": "whole_owning_block",
         "component": span.component,
         "text_start_codepoint": span.text_start_codepoint,
@@ -252,7 +276,7 @@ def revalidate_evidence_batch(index: str | Path, items) -> list[dict]:
         if generation.manifest["generation_id"] != generation_id:
             raise DocQAError("EVIDENCE_SOURCE_INVALID", "Evidence generation differs")
         chunks = {chunk.chunk_id: chunk for chunk in generation.chunks}
-        sources = {}
+        sources, packages = {}, {}
         for item in items:
             chunk = chunks.get(item.chunk_id)
             if chunk is None or item.source_span not in chunk.source_spans:
@@ -261,12 +285,15 @@ def revalidate_evidence_batch(index: str | Path, items) -> list[dict]:
                 )
             if chunk.artifact_id not in sources:
                 sources[chunk.artifact_id] = _source(generation, chunk)
+                packages[chunk.artifact_id] = _reference_package(sources[chunk.artifact_id][0])
             artifact, ir = sources[chunk.artifact_id]
             text = resolve_span_text(ir, item.source_span)
             if sha256(text.encode("utf-8")).hexdigest() != item.source_span.source_text_sha256:
                 raise DocQAError("EVIDENCE_SOURCE_INVALID", "Evidence source span checksum differs")
             reference = {
-                **_reference(generation, chunk, item.source_span, artifact, ir),
+                **_reference(
+                    generation, chunk, item.source_span, artifact, ir, packages[chunk.artifact_id]
+                ),
                 "text": text,
             }
             _validate_reference(item, reference)

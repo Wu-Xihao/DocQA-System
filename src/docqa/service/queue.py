@@ -303,6 +303,24 @@ class JobQueue:
             )
             return self._decode(self._row(db, job_id))
 
+    def report_progress(self, job_id, owner, stage, current=None, total=None):
+        """Transient stage counters; only the current worker may update them."""
+        if not isinstance(stage, str) or not re.fullmatch(r"[a-z][a-z_]{0,39}", stage):
+            raise _error("SERVICE_INVALID_JOB", "Invalid progress stage")
+        if (current, total) != (None, None) and (
+            type(current) is not int
+            or type(total) is not int
+            or not 0 <= current <= total <= 100000000
+        ):
+            raise _error("SERVICE_INVALID_JOB", "Invalid progress counters")
+        value = {"progress": {"stage": stage, "current": current, "total": total}}
+        with self._write() as db:
+            self._owned(db, job_id, owner)
+            db.execute(
+                "UPDATE jobs SET result=?,updated_at=? WHERE job_id=?",
+                (_validate_json(value), self._now(), job_id),
+            )
+
     def finish(self, job_id: str, owner: str, result: dict) -> dict:
         encoded = _validate_json(result)
         now = self._now()

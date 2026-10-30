@@ -7,6 +7,7 @@ import math
 import os
 import sqlite3
 import tempfile
+from collections import Counter
 from contextlib import nullcontext
 from hashlib import sha256
 from pathlib import Path
@@ -145,7 +146,9 @@ def _sparse_value(value, vocab_size: int) -> dict[int, float]:
     return result
 
 
-def encode_cached(client, texts: list[str], route: str, root: Path, code: str, batch_size: int):
+def encode_cached(
+    client, texts: list[str], route: str, root: Path, code: str, batch_size: int, progress=None
+):
     profile = client.fingerprint()
 
     def validate(value):
@@ -194,6 +197,10 @@ def encode_cached(client, texts: list[str], route: str, root: Path, code: str, b
         else:
             pending[key] = text
     items = list(pending.items())
+    emit = progress or (lambda current, total: None)
+    occurrences = Counter(keys)
+    completed = sum(occurrences[key] for key in entries)
+    emit(completed, len(texts))
     for start in range(0, len(items), batch_size):
         batch = items[start : start + batch_size]
         vectors = client.encode([text for _, text in batch], input_type="document")
@@ -231,6 +238,8 @@ def encode_cached(client, texts: list[str], route: str, root: Path, code: str, b
                 os.fsync(stream.fileno())
             temporary.replace(cache / (key + ".json"))
             entries[key] = vector
+            completed += occurrences[key]
+        emit(completed, len(texts))
     return [entries[key] for key in keys], hits
 
 
@@ -400,13 +409,25 @@ def _build_index(
         joint = shared_encoder(dense, sparse) if sparse_enabled else None
         if joint is not None:
             pairs, dense_hits = encode_cached(
-                joint, texts, "dense_sparse", root, code, min(options.dense.batch_size, 10)
+                joint,
+                texts,
+                "dense_sparse",
+                root,
+                code,
+                min(options.dense.batch_size, 10),
+                progress=lambda current, total: emit("dense", current, total),
             )
             vectors = [pair["dense"] for pair in pairs]
             sparse_vectors = [pair["sparse"] for pair in pairs]
         else:
             vectors, dense_hits = encode_cached(
-                dense, texts, "dense", root, code, options.dense.batch_size
+                dense,
+                texts,
+                "dense",
+                root,
+                code,
+                options.dense.batch_size,
+                progress=lambda current, total: emit("dense", current, total),
             )
         emit("dense", len(texts), len(texts))
         cache_hits = {"dense": dense_hits}
@@ -415,7 +436,13 @@ def _build_index(
             emit("sparse", len(texts), len(texts))
         elif sparse_enabled:
             sparse_vectors, sparse_hits = encode_cached(
-                sparse, texts, "sparse", root, code, options.sparse.batch_size
+                sparse,
+                texts,
+                "sparse",
+                root,
+                code,
+                options.sparse.batch_size,
+                progress=lambda current, total: emit("sparse", current, total),
             )
             cache_hits["sparse"] = sparse_hits
             emit("sparse", len(texts), len(texts))

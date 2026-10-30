@@ -1,145 +1,320 @@
 import { $, el, button, toast, errorText } from "./dom.js";
 import { api } from "./api.js";
+import { icon } from "./icons.js";
 
-const run = (fn) => async () => {
-  try {
-    await fn();
-  } catch (e) {
-    toast(errorText(e));
-  }
-};
+function intervalLabel(seconds) {
+  if (seconds % 3600 === 0) return "每 " + seconds / 3600 + " 小时";
+  if (seconds % 60 === 0) return "每 " + seconds / 60 + " 分钟";
+  return "每 " + seconds + " 秒";
+}
+
 export function bindMaintenance() {
   const section = $("maintenance-section");
-  const load = async () => {
-    const data = await api("/maintenance/sources");
-    $("watch-allowed").textContent =
-      "允许目录：" + data.allowed_roots.join("；");
-    const list = $("watch-list");
-    list.replaceChildren();
-    for (const source of data.items) {
-      const row = el("article", "watch-item");
-      row.append(
-        el("strong", "", source.path),
-        el(
-          "small",
-          "subtle",
-          `${source.enabled ? "监控中" : "已暂停"} · ${source.types.join(" / ")} · ${source.recursive ? "含子目录" : "当前目录"} · ${source.interval_seconds} 秒`,
-        ),
-      );
-      const actions = el("div", "scope-actions");
-      actions.append(
-        button(
-          "立即扫描",
-          run(async () => {
-            await api(`/maintenance/sources/${source.source_id}/scan`, {
-              method: "POST",
-              body: {},
-            });
-            toast("已加入扫描队列");
-          }),
-        ),
-        button(
-          source.enabled ? "暂停" : "恢复",
-          run(async () => {
-            await api(`/maintenance/sources/${source.source_id}`, {
-              method: "PATCH",
-              body: { enabled: !source.enabled },
-            });
-            await load();
-          }),
-        ),
-        button(
-          "查看文件",
-          run(async () => {
-            const value = await api(
-              `/maintenance/sources/${source.source_id}/files`,
-            );
-            const details = el("details");
-            details.open = true;
-            details.append(
-              el(
-                "summary",
-                "",
-                `发现 ${value.files.length} 份文件${value.complete ? "" : " · 扫描有缺口"}`,
-              ),
-            );
-            for (const file of value.files)
-              details.append(el("p", "field-help", file.path));
-            row.querySelector("details")?.remove();
-            row.append(details);
-          }),
-        ),
-        button(
-          "删除监控",
-          run(async () => {
-            if (
-              !confirm(
-                "删除此监控，并将所属资料移出最新知识库？原始文件保留；仅临时停止请使用暂停。",
-              )
-            )
-              return;
-            await api(`/maintenance/sources/${source.source_id}`, {
-              method: "DELETE",
-            });
-            await load();
-          }),
-        ),
-      );
-      row.append(actions);
-      list.append(row);
-    }
-    if (!data.items.length)
-      list.append(
-        el(
-          "p",
-          "subtle",
-          "尚未登记监控目录。浏览器上传文件夹为一次性导入，请在这里登记本机目录以持续更新。",
-        ),
-      );
+  let ready = false,
+    loading = null,
+    loadedAt = 0,
+    signature = "",
+    feedbackTimer;
+  const feedback = (message = "", failed = false) => {
+    clearTimeout(feedbackTimer);
+    const node = $("watch-feedback");
+    node.textContent = message;
+    node.hidden = !message;
+    node.classList.toggle("error", failed);
+    if (message && !failed && !message.startsWith("正在"))
+      feedbackTimer = setTimeout(() => {
+        node.textContent = "";
+        node.hidden = true;
+      }, 6000);
   };
-  section.addEventListener("toggle", () => {
-    if (section.open) run(load)();
+  const perform = async (control, work) => {
+    if (control.disabled) return;
+    control.disabled = true;
+    control.setAttribute("aria-busy", "true");
+    try {
+      await work();
+    } catch (error) {
+      feedback(errorText(error), true);
+    } finally {
+      control.disabled = false;
+      control.removeAttribute("aria-busy");
+    }
+  };
+  const formOpen = (open) => {
+    $("watch-form").hidden = !open;
+    $("watch-new").setAttribute("aria-expanded", String(open));
+    $("watch-new").hidden = open;
+    if (open) $("watch-path").focus();
+  };
+  const action = (label, glyph, work, compact = false) => {
+    const control = button(
+      compact ? "" : label,
+      () => perform(control, work),
+      compact ? "watch-icon-button" : "watch-menu-action",
+    );
+    control.prepend(icon(glyph, 17));
+    control.title = label;
+    control.setAttribute("aria-label", label);
+    return control;
+  };
+  function sourceRow(source) {
+    const name =
+      source.path
+        .replace(/[\\/]$/, "")
+        .split(/[\\/]/)
+        .at(-1) || source.path;
+    const row = el("article", "watch-item");
+    row.dataset.sourceId = source.source_id;
+    const heading = el("div", "watch-item-heading");
+    const title = el("strong", "watch-name", name);
+    title.title = source.path;
+    const badge = el(
+      "span",
+      "watch-state",
+      source.enabled ? "已启用" : "已暂停",
+    );
+    badge.dataset.enabled = String(source.enabled);
+    heading.append(icon("folder", 18), title, badge);
+    const path = el("p", "watch-path", source.path);
+    path.title = source.path;
+    row.append(
+      heading,
+      path,
+      el(
+        "p",
+        "watch-meta",
+        intervalLabel(source.interval_seconds) +
+          " · " +
+          (source.recursive ? "含子目录" : "当前目录") +
+          " · " +
+          source.types.map((t) => t.toUpperCase()).join(" / "),
+      ),
+    );
+    const footer = el("div", "watch-item-actions");
+    const scan = action("立即扫描", "refresh", async () => {
+      await api("/maintenance/sources/" + source.source_id + "/scan", {
+        method: "POST",
+        body: {},
+      });
+      feedback("扫描已排队，完成后资料库会自动更新。");
+      window.dispatchEvent(new Event("docqa:library-dirty"));
+    });
+    const menu = el("details", "watch-menu"),
+      summary = el("summary");
+    summary.setAttribute("aria-label", "管理目录：" + name);
+    summary.title = "管理目录";
+    summary.append(icon("more", 19));
+    const panel = el("div", "watch-menu-panel");
+    panel.append(
+      action(
+        source.enabled ? "暂停同步" : "恢复同步",
+        "folder-sync",
+        async () => {
+          await api("/maintenance/sources/" + source.source_id, {
+            method: "PATCH",
+            body: { enabled: !source.enabled },
+          });
+          menu.open = false;
+          await load(true);
+        },
+      ),
+      action("查看文件", "report", async () => {
+        const value = await api(
+          "/maintenance/sources/" + source.source_id + "/files",
+        );
+        menu.open = false;
+        row.querySelector(".watch-files")?.remove();
+        const details = el("details", "watch-files"),
+          caption = el(
+            "summary",
+            "",
+            "已发现 " +
+              value.files.length +
+              " 份文件" +
+              (value.complete ? "" : "（扫描未完成）"),
+          );
+        details.open = true;
+        details.append(caption);
+        let shown = 0;
+        const more = button("加载更多", () => appendFiles(), "text-button");
+        function appendFiles() {
+          const fragment = document.createDocumentFragment();
+          for (const file of value.files.slice(shown, shown + 40)) {
+            const item = el("p", "", file.path.split(/[\\/]/).at(-1));
+            item.title = file.path;
+            fragment.append(item);
+          }
+          shown += 40;
+          details.insertBefore(fragment, more);
+          more.hidden = shown >= value.files.length;
+        }
+        details.append(more);
+        appendFiles();
+        row.append(details);
+      }),
+      action("移除监控", "close", async () => {
+        if (
+          !confirm(
+            "移除此监控，并将所属资料移出最新知识库？原始文件保留；临时停止请选择暂停同步。",
+          )
+        )
+          return;
+        await api("/maintenance/sources/" + source.source_id, {
+          method: "DELETE",
+        });
+        menu.open = false;
+        await load(true);
+        window.dispatchEvent(new Event("docqa:library-dirty"));
+      }),
+    );
+    menu.append(summary, panel);
+    footer.append(scan, menu);
+    row.append(footer);
+    return row;
+  }
+  function load(force = false) {
+    if (!ready) return Promise.resolve();
+    if (loading) return loading;
+    if (!force && Date.now() - loadedAt < 15000) return Promise.resolve();
+    const list = $("watch-list");
+    list.setAttribute("aria-busy", "true");
+    feedback("正在读取目录…");
+    loading = api("/maintenance/sources")
+      .then((data) => {
+        loadedAt = Date.now();
+        const next = JSON.stringify(data);
+        if (next !== signature) {
+          signature = next;
+          const fragment = document.createDocumentFragment();
+          for (const source of data.items) fragment.append(sourceRow(source));
+          if (!data.items.length) {
+            const empty = el("div", "watch-empty");
+            empty.append(
+              icon("folder-sync", 24),
+              el("strong", "", "还没有监控目录"),
+              el("p", "", "添加目录，自动同步后续变化。"),
+            );
+            fragment.append(empty);
+          }
+          list.replaceChildren(fragment);
+          $("watch-count").textContent = data.items.length;
+          $("watch-count").hidden = !data.items.length;
+          $("watch-allowed").replaceChildren(
+            ...data.allowed_roots.map((path) => el("p", "allowed-root", path)),
+          );
+        }
+        feedback();
+      })
+      .catch((error) => feedback(errorText(error), true))
+      .finally(() => {
+        list.removeAttribute("aria-busy");
+        loading = null;
+      });
+    return loading;
+  }
+  const controls = [
+    "watch-new",
+    "watch-refresh",
+    "watch-add",
+    "index-status",
+    "index-rebuild",
+  ];
+  controls.forEach((id) => {
+    $(id).disabled = true;
   });
-  $("watch-refresh").addEventListener("click", run(load));
-  $("watch-add").addEventListener(
-    "click",
-    run(async () => {
-      const types = [
-        ...document.querySelectorAll("[data-watch-type]:checked"),
-      ].map((n) => n.dataset.watchType);
-      if (!types.length) {
-        toast("至少选择一种文档类型");
-        return;
-      }
+  window.addEventListener(
+    "docqa:ready",
+    (event) => {
+      ready = !!event.detail.uploads_enabled;
+      controls.forEach((id) => {
+        $(id).disabled = !ready;
+      });
+      if (ready && section.open) load();
+      if (!ready) feedback("当前未启用目录同步。");
+    },
+    { once: true },
+  );
+  section.addEventListener("toggle", () => {
+    if (section.open) load();
+  });
+  $("watch-refresh").addEventListener("click", () =>
+    perform($("watch-refresh"), () => load(true)),
+  );
+  $("watch-new").addEventListener("click", () => formOpen(true));
+  $("watch-cancel").addEventListener("click", () => {
+    formOpen(false);
+    $("watch-new").focus();
+  });
+  $("watch-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const types = [
+      ...document.querySelectorAll("[data-watch-type]:checked"),
+    ].map((n) => n.dataset.watchType);
+    if (!types.length) {
+      feedback("请至少选择一种文档类型。", true);
+      return;
+    }
+    const path = $("watch-path").value.trim();
+    if (!path) {
+      feedback("请输入文件夹路径。", true);
+      $("watch-path").focus();
+      return;
+    }
+    perform($("watch-add"), async () => {
       await api("/maintenance/sources", {
         method: "POST",
         body: {
-          path: $("watch-path").value.trim(),
+          path,
           types,
           recursive: $("watch-recursive").checked,
           interval_seconds: Number($("watch-interval").value),
           category: "auto",
         },
       });
-      toast("监控目录已登记，自动分类并增量处理");
-      await load();
+      $("watch-path").value = "";
+      formOpen(false);
+      await load(true);
+      $("watch-new").focus();
+      toast("目录已添加，后台将按设置同步。");
+      window.dispatchEvent(new Event("docqa:library-dirty"));
+    });
+  });
+  $("index-status").addEventListener("click", () =>
+    perform($("index-status"), async () => {
+      $("index-status-text").textContent = "正在读取知识库状态…";
+      try {
+        const value = await api("/maintenance/index", { timeoutMs: 30000 });
+        $("index-status-text").textContent =
+          (value.documents ?? 0) +
+          " 份资料，" +
+          (value.chunks ?? 0) +
+          " 个文本块";
+      } catch (error) {
+        $("index-status-text").textContent = errorText(error);
+        throw error;
+      }
     }),
   );
-  $("index-rebuild").addEventListener(
-    "click",
-    run(async () => {
+  $("index-rebuild").addEventListener("click", () =>
+    perform($("index-rebuild"), async () => {
       await api("/maintenance/index/build", { method: "POST", body: {} });
-      toast("已加入索引更新队列");
+      $("index-status-text").textContent = "更新已排队，完成后自动生效。";
+      window.dispatchEvent(new Event("docqa:library-dirty"));
     }),
   );
-  $("index-status").addEventListener(
-    "click",
-    run(async () => {
-      const value = await api("/maintenance/index", { timeoutMs: 30000 });
-      $("index-status-text").textContent =
-        `已入库 ${value.documents ?? 0} 份 · ${value.chunks ?? 0} 个文本块 · ${value.vector_backend === "sqlite_vec" ? "SQLite-vec 向量库" : "旧版向量存储"} · ${(value.recall_routes || []).length} 路召回`;
-    }),
-  );
+  document.addEventListener("click", (event) => {
+    for (const menu of section.querySelectorAll(".watch-menu[open]"))
+      if (!menu.contains(event.target)) menu.open = false;
+  });
+  section.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    const menu = section.querySelector(".watch-menu[open]");
+    if (menu) {
+      event.stopPropagation();
+      menu.open = false;
+      menu.querySelector("summary").focus();
+    }
+  });
 }
 
 export async function showImageAnalysis(identity) {

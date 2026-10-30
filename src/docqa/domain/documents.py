@@ -21,7 +21,7 @@ class ParseWarning(Contract):
 
 
 class SourceLocator(Contract):
-    locator_type: Literal["pdf_page", "docx_object", "pptx_shape", "derived_page"]
+    locator_type: Literal["pdf_page", "docx_object", "pptx_shape", "sheet_range", "derived_page"]
     native_ref: dict[str, JsonValue] = Field(default_factory=dict)
     page: int | None = Field(default=None, ge=1)
     slide: int | None = Field(default=None, ge=1)
@@ -42,6 +42,10 @@ class SourceLocator(Contract):
             raise ValueError("PDF locator requires a physical page number")
         if self.locator_type == "pptx_shape" and self.slide is None:
             raise ValueError("PPTX locator requires slide index")
+        if self.locator_type == "sheet_range" and (
+            not self.native_ref.get("sheet") or self.page is not None or self.slide is not None
+        ):
+            raise ValueError("Sheet locator requires a sheet name and no page/slide")
         return self
 
 

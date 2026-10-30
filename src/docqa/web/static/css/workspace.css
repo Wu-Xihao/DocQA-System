@@ -289,6 +289,7 @@ summary {
   box-shadow: 0 2px 8px #6b5bd618;
 }
 .sidebar-section {
+  flex: 0 0 auto;
   border-top: 1px solid var(--border);
 }
 .sidebar-section > summary {
@@ -501,9 +502,6 @@ summary {
   font-size: 13px;
   line-height: 1.7;
   color: var(--muted);
-}
-.history-section {
-  flex: 1;
 }
 .history-tabs {
   display: flex;
@@ -2333,29 +2331,6 @@ dialog::backdrop {
   .reader-image-grid {
     grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   }
-}
-
-.watch-input {
-  width: 100%;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--surface);
-  color: var(--text);
-  margin: 6px 0 12px;
-}
-.watch-item {
-  padding: 12px 0;
-  border-top: 1px solid var(--border);
-  display: grid;
-  gap: 8px;
-  overflow-wrap: anywhere;
-}
-.watch-item .scope-actions {
-  flex-wrap: wrap;
-}
-.watch-item button {
-  font-size: 13px;
 }
 
 .stream-label {
