@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -30,6 +29,7 @@ from docqa.docbase.storage import (
 )
 from docqa.domain.errors import DocQAError
 from docqa.domain.formats import UPLOAD_FORMATS
+from docqa.processes import module_command
 from docqa.service.config import ServiceOptions
 from docqa.service.config import load_options as load_service_options
 from docqa.service.pipeline import Service
@@ -451,7 +451,7 @@ class Workspace:
                     if name in os.environ:
                         environment[name] = os.environ[name]
         self.process = subprocess.Popen(
-            [sys.executable, "-m", "docqa.web.ingestion_worker", str(snapshot), str(service.root)],
+            module_command("docqa.web.ingestion_worker", str(snapshot), str(service.root)),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

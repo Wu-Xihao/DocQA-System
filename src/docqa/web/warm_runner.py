@@ -4,11 +4,11 @@ import json
 import os
 import queue
 import subprocess
-import sys
 import threading
 import time
 
 from docqa.domain.errors import DocQAError
+from docqa.processes import module_command
 from docqa.web.runner import (
     MAX_INPUT_BYTES,
     STAGES,
@@ -44,7 +44,7 @@ class WarmRunner(HeadlessRunner):
         self.overflow, self.total = threading.Event(), 0
         self.environment = environment
         self.process = subprocess.Popen(
-            [sys.executable, "-m", "docqa.web.worker", "--persistent"],
+            module_command("docqa.web.worker", "--persistent"),
             cwd=self.runs,
             env=environment,
             stdin=subprocess.PIPE,

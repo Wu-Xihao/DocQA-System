@@ -14,6 +14,7 @@ from pydantic import Field
 from docqa.doc2md.adapters import HttpVisionClient
 from docqa.domain.documents import Contract
 from docqa.domain.errors import DocQAError
+from docqa.processes import module_command
 
 
 class VisualItem(Contract):
@@ -134,7 +135,7 @@ def isolated_check(path, question, claims, config, *, cancelled=lambda: False):
     if len(raw) > 65536:
         raise DocQAError("INVALID_REQUEST", "Visual request exceeds limit")
     process = subprocess.Popen(
-        [sys.executable, "-m", "docqa.web.visual"],
+        module_command("docqa.web.visual"),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,

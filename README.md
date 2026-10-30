@@ -2,6 +2,29 @@
 
 本地多模态文档问答工作台：PDF / DOCX / PPTX / XLSX / CSV → 可溯源 Markdown → 三路检索 → 有引用的回答、表格、关系图、思维导图和演示文稿。
 
+## Windows exe 便携版
+
+生成文件位于 `dist/DocQA/DocQA.exe`，分发包为 `dist/DocQA-Windows-x64.zip`。
+解压**整个文件夹**后双击 exe 即可打开网页，无须 Python/conda；保留 `_internal` 运行库。
+首次启动自动创建本机 YAML 和 `configs/.env`，填写 API 配置后重启即可真实使用。
+密钥、私有资料、历史聊天和现有索引不包含在分发包中；完整 OCR/Office 渲染另需 Tesseract 与 LibreOffice。
+
+```powershell
+.\DocQA.exe --demo          # 离线合成演示
+.\DocQA.exe --check         # 本机依赖检查，不调用模型
+.\DocQA.exe --port 8766     # 端口被占用时
+.\DocQA.exe --cli --help    # 保留原有 CLI 功能，自动载入 configs/.env
+```
+
+使用说明随包提供。数据保存在 exe 旁的 `runtime` / `data/private`，可用 `--home D:\DocQAData` 指定目录。
+Web 负责上传处理；持续目录监控仍可在独立终端运行
+`DocQA.exe --cli service run --state runtime/service-user --config configs/local.service.yaml`。
+关闭服务时在控制台按 Ctrl+C；关闭网页不会停止后台。
+
+源码构建使用 Windows x64 Python 3.12：安装本页依赖后执行 `python scripts/build_exe.py`。
+构建脚本收集应用与公开模板、检查本机依赖并生成校验摘要；若旧分发目录已产生用户数据，会拒绝覆盖。
+程序未做商业代码签名。打包设计与验证范围见[系统设计说明](Document/系统设计说明.md)。
+
 - [系统设计说明](Document/系统设计说明.md)：当前架构、数据流、存储、校验和实现边界。
 - [知识消费约定](AGENTS.md)：先检索、按证据回答、强制引用与原图核对。
 

@@ -43,5 +43,8 @@ respx>=0.22,<0.23
 ruff>=0.11,<1
 playwright>=1.50,<2
 
+# Windows executable packaging (build-time only)
+pyinstaller>=6.22,<7
+
 # Optional historical local BGE encoder: pip install -e .[legacy-sparse]
 # The current DashScope three-route deployment requires no FlagEmbedding or local weights.

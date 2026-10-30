@@ -13,7 +13,6 @@ import os
 import queue
 import re
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -24,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from docqa.agent.config import AgentOptions
 from docqa.agent.sessions import SessionStore
 from docqa.domain.errors import DocQAError
+from docqa.processes import module_command
 from docqa.web.chat import ChatMessage, load_chat, request_digest
 
 MAX_INPUT_BYTES = 1_048_576
@@ -370,7 +370,7 @@ class HeadlessRunner:
             ) from exc
         try:
             process = subprocess.Popen(
-                [sys.executable, "-m", "docqa.web.worker"],
+                module_command("docqa.web.worker"),
                 cwd=directory,
                 env=environment,
                 stdin=subprocess.PIPE,

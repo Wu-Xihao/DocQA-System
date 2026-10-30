@@ -1,0 +1,29 @@
+DocQA Windows 便携版（64 位）
+
+1. 将整个 DocQA 文件夹解压到可写目录，如 D:\Apps\DocQA。
+   不要只复制 DocQA.exe；_internal 是必需的运行库。无须安装 Python/conda。
+2. 双击 DocQA.exe，程序会打开本机网页，并创建 configs/local.*.yaml 与 configs/.env。
+3. 首次真实使用，请在 configs/.env 填入百炼、模力方舟和 DeepSeek 的 API 配置。
+   修改后关闭程序再重新启动。YAML 中的授权目录和 OCR/Office 路径可按需调整。
+4. 在网页上传资料，等待解析入库后再进行文档问答。
+5. 停止：在 DocQA 控制台按 Ctrl+C。不要只关闭浏览器，后台会继续运行。
+
+常用命令（在此文件夹打开 PowerShell）：
+  .\DocQA.exe --demo                    离线合成演示，不调用真实模型
+  .\DocQA.exe --port 8766               更换端口
+  .\DocQA.exe --check                   检查运行库，不调用模型
+  .\DocQA.exe --cli --help              原有命令行功能
+  .\DocQA.exe --cli service run --state runtime/service-user --config configs/local.service.yaml
+                                      持续目录监控，使用独立终端运行
+  .\DocQA.exe --home D:\DocQAData        指定配置和数据保存目录
+
+注意：
+* 真实问答需联网与有效 API 密钥；离线演示不代表真实语义效果。
+* 完整 OCR 另需安装 Tesseract（chi_sim、eng）；Office 渲染另需 LibreOffice。
+  二者不随本包分发，加入 PATH 或在 configs/local.service.yaml 的 parse 中配置绝对路径。
+* Web 默认为 auto，会处理网页上传任务。持续监控目录请运行上面的 Service 命令。
+* runtime 保存本机资料、索引、聊天及成果，data/private 保存资料副本，请自行备份。
+* 本包不包含原项目的密钥、本机配置、聊天记录、索引和私有资料。
+* 默认地址 http://127.0.0.1:8765，仅本机访问。
+* 程序未做商业代码签名；若系统安全软件拦截，请核对来源和 .zip.sha256 摘要。
+* 更新版本请先退出程序，备份数据，再替换程序文件，保留 configs、data、runtime。
