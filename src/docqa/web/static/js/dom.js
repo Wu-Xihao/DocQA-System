@@ -83,6 +83,11 @@ export const errorNames = {
   SOURCE_NOT_DIRECTORY: "请输入文件夹的完整路径。",
   SOURCE_ROOT_NOT_ALLOWED:
     "此目录不在后台 allowed_source_roots 中，请先在 Service 配置中授权。",
+  ROOT_TOO_BROAD: "不能授权磁盘根目录或用户主目录本身，请选择具体的资料文件夹。",
+  ROOT_PROTECTED: "不能授权系统或程序目录。",
+  ROOT_IN_USE: "该授权目录下仍有监控目录，请先移除监控。",
+  ROOT_CONFIG_UNAVAILABLE: "当前未配置 Service YAML，无法在网页中授权目录。",
+  ROOT_AUTHORIZATION_DISABLED: "网页授权已在 Web 配置中关闭（allow_root_authorization）。",
   DELETION_CLEANUP_PENDING: "记录已移除，后端文件仍在清理，将自动重试。",
   FORMAT_UNSUPPORTED: "请上传 PDF、DOCX 或 PPTX 文件。",
   BODY_TOO_LARGE: "文件超过大小限制。",

@@ -111,7 +111,7 @@ python -m dotenv -f configs/.env run -- python scripts/docqa.py service run --st
 python -m dotenv -f configs/.env run -- python scripts/docqa.py web run --config configs/local.web.yaml
 ```
 
-打开 **http://127.0.0.1:8765**，等首批解析和建库完成后提问。文件夹上传只上传文档副本；**浏览器不能持续监控原文件夹**。持续监控需新增服务器可访问的监控目录，且位于 Service 授权根内。
+打开 **http://127.0.0.1:8765**，等首批解析和建库完成后提问。文件夹上传只上传文档副本；**浏览器不能持续监控原文件夹**。持续监控需新增服务器可访问的监控目录，且位于 Service 授权根内。在“目录监控与维护”中添加不在授权范围内的目录时，网页会询问是否授权：确认后写入 `local.service.yaml` 的 `allowed_source_roots`（保留注释）并继续添加监控；磁盘根目录、用户主目录本身、系统/程序目录和 DocQA 状态/索引目录会被拒绝。网页授权的目录可在同一面板“取消授权”（需先移除其中的监控）。`service_mode: auto` 立即生效；`external` 需重启终端 A 的 Service。不需要此功能时在 `local.web.yaml` 设 `allow_root_authorization: false`。
 
 聊天输入区默认“文档检索”，沿用资料范围和引用校验；选择“正常聊天”可直接与 `local.web.yaml` 中 `agent.generator` 的 API 会话，无须先建库。正常聊天只携带同一对话近期的正常聊天上下文，不检索资料、不自动带入文档内容，也不生成文档引用或来源成果；切换模式后的下一条消息生效，重新生成沿用原消息模式。无需新增模型密钥。
 

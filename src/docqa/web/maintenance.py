@@ -1,5 +1,6 @@
 """Bounded same-origin controls for server-local directory monitoring."""
 
+import os
 import time
 
 from fastapi import Request
@@ -50,6 +51,10 @@ def poll_monitors(workspace):
 
 
 def install(app, workspace):
+    from docqa.web.roots import install as install_roots
+
+    authorized = install_roots(app, workspace)
+
     @app.get("/api/v1/maintenance/sources")
     def sources(request: Request):
         service = workspace.service()
@@ -57,8 +62,17 @@ def install(app, workspace):
             item["id"]
             for item in workspace.store.objects("watch_source", request.state.client_id, 1000)
         }
+        mine = {os.path.normcase(p) for p in authorized(request.state.client_id)}
         return {
             "allowed_roots": [str(p) for p in service.options.allowed_source_roots],
+            "web_authorized_roots": [
+                str(p)
+                for p in service.options.allowed_source_roots
+                if os.path.normcase(os.path.abspath(p)) in mine
+            ],
+            "can_authorize": bool(
+                workspace.options.allow_root_authorization and workspace.options.service_config
+            ),
             "items": [
                 s for s in service.list_sources() if s["source_id"] in entries and not s["removed"]
             ],

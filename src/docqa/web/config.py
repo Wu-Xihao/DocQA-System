@@ -24,6 +24,8 @@ class WebOptions(Contract):
     service_config: Path | None = None
     upload_root: Path | None = None
     service_mode: Literal["auto", "external", "disabled"] = "auto"
+    # Let the local browser append folders to the Service YAML allowed_source_roots.
+    allow_root_authorization: bool = True
     max_upload_bytes: int = Field(default=104857600, ge=1024, le=1073741824)
     max_source_download_bytes: int = Field(default=268435456, ge=1024, le=1073741824)
     app_name: str = Field(default="DocQA 文档工作台", min_length=1, max_length=80)

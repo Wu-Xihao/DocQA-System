@@ -368,6 +368,12 @@ class WorkspaceStore:
             )
         return value
 
+    def object_delete(self, kind, identity, owner):
+        with self.tasks.transaction() as db:
+            db.execute(
+                "DELETE FROM ws_objects WHERE kind=? AND id=? AND owner=?", (kind, identity, owner)
+            )
+
     def object_update(self, kind, owner, value):
         """Worker updates must never recreate an object deleted while work ran."""
         with self.tasks.transaction() as db:

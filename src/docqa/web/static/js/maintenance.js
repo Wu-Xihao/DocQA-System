@@ -14,6 +14,7 @@ export function bindMaintenance() {
     loading = null,
     loadedAt = 0,
     signature = "",
+    canAuthorize = false,
     feedbackTimer;
   const feedback = (message = "", failed = false) => {
     clearTimeout(feedbackTimer);
@@ -182,6 +183,7 @@ export function bindMaintenance() {
     loading = api("/maintenance/sources")
       .then((data) => {
         loadedAt = Date.now();
+        canAuthorize = !!data.can_authorize;
         const next = JSON.stringify(data);
         if (next !== signature) {
           signature = next;
@@ -199,8 +201,27 @@ export function bindMaintenance() {
           list.replaceChildren(fragment);
           $("watch-count").textContent = data.items.length;
           $("watch-count").hidden = !data.items.length;
+          const mine = new Set(data.web_authorized_roots || []);
           $("watch-allowed").replaceChildren(
-            ...data.allowed_roots.map((path) => el("p", "allowed-root", path)),
+            ...data.allowed_roots.map((path) => {
+              const row = el("p", "allowed-root", path);
+              if (mine.has(path)) {
+                const revoke = button("取消授权", () =>
+                  perform(revoke, async () => {
+                    if (!confirm(`取消授权 ${path}？其中不能有仍在监控的目录。`))
+                      return;
+                    await api("/maintenance/roots", {
+                      method: "DELETE",
+                      body: { path },
+                    });
+                    await load(true);
+                    toast("已取消授权。");
+                  }),
+                );
+                row.append(" ", revoke);
+              }
+              return row;
+            }),
           );
         }
         feedback();
@@ -261,16 +282,28 @@ export function bindMaintenance() {
       return;
     }
     perform($("watch-add"), async () => {
-      await api("/maintenance/sources", {
-        method: "POST",
-        body: {
-          path,
-          types,
-          recursive: $("watch-recursive").checked,
-          interval_seconds: Number($("watch-interval").value),
-          category: "auto",
-        },
-      });
+      const body = {
+        path,
+        types,
+        recursive: $("watch-recursive").checked,
+        interval_seconds: Number($("watch-interval").value),
+        category: "auto",
+      };
+      try {
+        await api("/maintenance/sources", { method: "POST", body });
+      } catch (error) {
+        if (error.code !== "SOURCE_ROOT_NOT_ALLOWED" || !canAuthorize) throw error;
+        if (
+          !confirm(
+            `“${path}” 尚未授权给后台。
+授权后将写入 Service 配置的 allowed_source_roots，后台可读取该目录下的资料。是否授权并添加监控？`,
+          )
+        )
+          return;
+        feedback("正在授权目录…");
+        await api("/maintenance/roots", { method: "POST", body: { path } });
+        await api("/maintenance/sources", { method: "POST", body });
+      }
       $("watch-path").value = "";
       formOpen(false);
       await load(true);
